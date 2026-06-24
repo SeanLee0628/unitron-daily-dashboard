@@ -154,13 +154,17 @@ def day_block(date, inbound, outbound):
 
 
 def open_wb(raw, password):
-    try:
+    try:                                                 # 1) 평문 xlsx
+        return openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception:
+        pass
+    try:                                                 # 2) 암호화 → 복호화
         off = msoffcrypto.OfficeFile(io.BytesIO(raw))
-        off.load_key(password=password)
+        off.load_key(password=password or "")
         dec = io.BytesIO(); off.decrypt(dec)
         return openpyxl.load_workbook(dec, read_only=True, data_only=True)
     except Exception:
-        return openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        raise ValueError("엑셀을 열 수 없습니다. 비밀번호가 비었거나 틀렸을 수 있어요 — 업로드 화면의 '비밀번호' 칸에 입력하세요 (예: 9178).")
 
 
 def office_block(name, per):
