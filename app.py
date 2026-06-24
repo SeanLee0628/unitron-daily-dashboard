@@ -608,20 +608,31 @@ function delta(t,y){
 function renderApp(){
   document.getElementById('land').style.display='none';
   document.getElementById('dash').style.display='block';
-  document.getElementById('offseg').innerHTML='<span class="lab">영업실</span>'+DATA.offices.map((o,i)=>{
-    const all=o.name==='전체 합계'?' all':'';
-    return `<button class="${all}" onclick="selectOffice(${i})">${esc(o.name)}</button>`;
-  }).join('');
   document.getElementById('foot').textContent='자료: 사내 일일 입출고 엑셀 (날짜 시트) · 입고/출고 마스터 시트 미사용 · 파일명 (영업N실)로 실 구분';
   const slug=location.pathname.replace(/\//g,'');
   let idx=0;
   if(slug){ const i=DATA.offices.findIndex(o=>officeSlug(o.name)===slug); if(i>=0) idx=i; }
   selectOffice(idx);
 }
+function buildOffseg(){
+  const seg=document.getElementById('offseg');
+  if(O.name==='전체 합계'){            // 전체 페이지: 모든 실 버튼 표시
+    seg.innerHTML='<span class="lab">영업실</span>'+DATA.offices.map((o,i)=>{
+      const all=o.name==='전체 합계'?' all':'';
+      const on=i===OFFI?' on':'';
+      return `<button class="${all}${on}" onclick="selectOffice(${i})">${esc(o.name)}</button>`;
+    }).join('');
+  }else{                              // 개별 실 페이지: 전체 합계 버튼만 (다른 실로 이동 불가)
+    const ai=DATA.offices.findIndex(o=>o.name==='전체 합계');
+    let h=`<span class="lab">${esc(O.name)}</span>`;
+    if(ai>=0) h+=`<button class="all" onclick="selectOffice(${ai})">← 전체 합계</button>`;
+    seg.innerHTML=h;
+  }
+}
 function selectOffice(i){
   OFFI=i; O=DATA.offices[i];
   history.replaceState(null,'','/'+officeSlug(O.name));
-  document.querySelectorAll('#offseg button').forEach((b,j)=>b.classList.toggle('on',j===i));
+  buildOffseg();
   renderOffice();
 }
 function renderOffice(){
