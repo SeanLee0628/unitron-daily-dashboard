@@ -295,6 +295,36 @@ def _send_outlook(emails, subject, body, send):
         pythoncom.CoUninitialize()
 
 
+def send_sms(numbers, text):
+    """솔라피(Solapi)로 문자 자동 발송. 환경변수 SOLAPI_API_KEY/SOLAPI_API_SECRET/SMS_FROM 필요."""
+    import hmac, hashlib, urllib.request
+    from datetime import datetime, timezone
+    key = os.environ.get("SOLAPI_API_KEY")
+    secret = os.environ.get("SOLAPI_API_SECRET")
+    sender = os.environ.get("SMS_FROM")
+    if not (key and secret and sender):
+        raise ValueError("문자 설정이 없습니다. 환경변수 SOLAPI_API_KEY / SOLAPI_API_SECRET / SMS_FROM(발신번호) 를 설정하세요.")
+    nums = [re.sub(r"\D", "", n) for n in numbers if re.sub(r"\D", "", n)]
+    if not nums:
+        raise ValueError("받는 휴대폰 번호가 없습니다.")
+    date = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    salt = os.urandom(16).hex()
+    sig = hmac.new(secret.encode(), (date + salt).encode(), hashlib.sha256).hexdigest()
+    auth = f"HMAC-SHA256 apiKey={key}, date={date}, salt={salt}, signature={sig}"
+    frm = re.sub(r"\D", "", sender)
+    messages = [{"to": n, "from": frm, "text": text} for n in nums]
+    body = json.dumps({"messages": messages}).encode("utf-8")
+    req = urllib.request.Request("https://api.solapi.com/messages/v4/send-many",
+                                 data=body, method="POST",
+                                 headers={"Authorization": auth, "Content-Type": "application/json"})
+    try:
+        resp = json.load(urllib.request.urlopen(req, timeout=20))
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"문자 발송 실패: {e.read().decode('utf-8', 'ignore')[:300]}")
+    gi = resp.get("groupInfo", {}).get("count", {}) if isinstance(resp, dict) else {}
+    return {"ok": True, "n": len(nums), "count": gi}
+
+
 def send_email(payload):
     """로컬 Outlook으로 회사메일 작성(검토 후 발송). SMTP_HOST 설정 시엔 SMTP 즉시발송."""
     emails = [e for e in (payload.get("emails") or []) if e]
@@ -356,6 +386,8 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             elif self.path == "/send":
                 result = send_email(payload)
+            elif self.path == "/sms":
+                result = send_sms(payload.get("numbers") or [], payload.get("text") or "")
             else:
                 self._send(404, json.dumps({"error": "not found"})); return
             self._send(200, json.dumps(result, ensure_ascii=False))
@@ -509,13 +541,13 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     </div>
     <div class="tablewrap"><div class="scroll" id="tablearea"></div></div>
 
-    <div class="card" id="emailcard" style="margin-top:22px">
-      <h2>📧 리포트 메일 작성 <span style="font-size:12px;color:var(--mut);font-weight:500">— 회사 Outlook으로 직원들에게 발송</span></h2>
-      <p class="desc">컨펌을 누르면 이 PC의 <b>회사 Outlook 계정</b>으로 <b id="recip-office">현재 실</b>의 리포트 메일이 작성돼 열립니다. 받는 사람(직원들) 확인 후 [보내기]를 누르면 회사 메일로 발송됩니다. (받는 사람은 아래에 미리 넣거나 Outlook에서 직접 입력 — 한 번 넣으면 저장됨)</p>
-      <input id="emailbox" type="text" placeholder="받는 사람 직원 이메일 (여러 명은 ; 또는 , · 비워도 됨)" style="width:100%;font-size:14px;padding:12px 14px;border:1.5px solid var(--line);border-radius:11px;font-family:inherit;outline:none">
+    <div class="card" id="smscard" style="margin-top:22px">
+      <h2>📱 대시보드 링크 문자 발송 <span style="font-size:12px;color:var(--mut);font-weight:500">— 각 직원에게 자동으로 링크 전송</span></h2>
+      <p class="desc">받는 사람 휴대폰 번호를 넣고 발송하면, <b>이 대시보드 링크가 문자로 각 사람에게 자동 전송</b>됩니다. (여러 명은 줄바꿈·콤마·세미콜론으로 구분 · 한 번 넣으면 저장)</p>
+      <textarea id="phonebox" rows="3" placeholder="010-1234-5678, 010-2222-3333, ..." style="width:100%;font-size:14px;padding:12px 14px;border:1.5px solid var(--line);border-radius:11px;font-family:inherit;outline:none;resize:vertical"></textarea>
       <div style="margin-top:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-        <button id="btn-confirm" class="confirmbtn">✅ 컨펌 — Outlook으로 메일 작성</button>
-        <span id="sendstatus" style="font-size:12.5px;color:var(--mut)"></span>
+        <button id="btn-sms" class="confirmbtn">📱 링크 문자 발송</button>
+        <span id="smsstatus" style="font-size:12.5px;color:var(--mut)"></span>
       </div>
     </div>
     <div class="foot" id="foot"></div>
@@ -596,22 +628,24 @@ function renderOffice(){
 }
 
 function buildEmailCard(){
-  document.getElementById('recip-office').textContent=O.name;
-  document.getElementById('emailbox').value = localStorage.getItem('staffEmails')||'';
-  document.getElementById('sendstatus').textContent='';
+  document.getElementById('phonebox').value = localStorage.getItem('staffPhones')||'';
+  document.getElementById('smsstatus').textContent='';
 }
-document.getElementById('btn-confirm').onclick=()=>{
+document.getElementById('btn-sms').onclick=()=>{
+  const st=document.getElementById('smsstatus');
+  const raw=document.getElementById('phonebox').value.trim();
+  localStorage.setItem('staffPhones', raw);
+  const numbers=[...new Set(raw.split(/[;,\s]+/).map(s=>s.trim()).filter(Boolean))];
+  if(!numbers.length){ st.textContent='⚠️ 받는 휴대폰 번호를 입력하세요.'; return; }
+  const link=location.origin+'/';
   const day=O.days[CUR];
-  const st=document.getElementById('sendstatus');
-  const raw=document.getElementById('emailbox').value.trim();
-  localStorage.setItem('staffEmails', raw);
-  const emails=[...new Set(raw.split(/[;,\s]+/).map(s=>s.trim()).filter(Boolean))];
-  st.textContent='Outlook에 작성 중…';
-  fetch('/send',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({office:O.name, date:day.date, day, emails})})
+  const text=`[입출고 대시보드] ${O.name} (${day.date})\n${link}`;
+  st.textContent=`문자 발송 중… (${numbers.length}명)`;
+  fetch('/sms',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({numbers, text})})
   .then(r=>r.json()).then(res=>{
     st.textContent = res.error ? ('오류: '+res.error)
-      : `✅ Outlook에 ${O.name} (${day.date}) 리포트가 열렸습니다. 받는 사람 확인 후 [보내기]를 누르세요.`;
+      : `✅ ${numbers.length}명에게 링크 문자를 발송했습니다.`;
   }).catch(e=>{ st.textContent='전송 오류: '+e; });
 };
 
