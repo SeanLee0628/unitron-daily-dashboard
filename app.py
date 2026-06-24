@@ -24,7 +24,7 @@ import msoffcrypto
 import openpyxl
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PW = "9178"
+DEFAULT_PW = os.environ.get("XLSX_PW", "")  # 비밀번호는 코드에 두지 않음 (업로드 화면 입력 또는 환경변수)
 CHART_JS = os.path.join(HERE, "chart.umd.min.js")
 DATA_FILE = os.path.join(os.environ.get("DATA_DIR", HERE), "saved_data.json")  # 데이터 저장(공유)
 
@@ -473,7 +473,7 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       <div class="h">.xlsx · 비밀번호 보호 지원 · 파일명의 (영업N실)로 실 구분</div>
       <input id="file" type="file" accept=".xlsx" multiple style="display:none">
     </div>
-    <div class="pwrow"><span>🔒 비밀번호</span><input id="pw" type="text" value="9178"></div>
+    <div class="pwrow"><span>🔒 비밀번호</span><input id="pw" type="text" placeholder="엑셀 비밀번호"></div>
     <div class="loading" id="loading"><span class="spin"></span>분석 중…</div>
     <div class="errmsg" id="errmsg"></div>
   </div>
