@@ -361,17 +361,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        path = self.path.split("?")[0]                   # ?office=... 쿼리는 무시(클라이언트가 처리)
-        if path in ("/", "/index.html"):
-            self._send(200, PAGE.replace("<!--CHARTJS-->", chart_js()), "text/html; charset=utf-8")
-        elif path == "/data":                            # 저장된 데이터(있으면)
+        path = self.path.split("?")[0]
+        if path == "/data":                              # 저장된 데이터(있으면)
             if os.path.exists(DATA_FILE):
                 with open(DATA_FILE, encoding="utf-8") as f:
                     self._send(200, f.read())
             else:
                 self._send(200, json.dumps({"offices": []}))
-        else:
-            self._send(404, "not found", "text/plain; charset=utf-8")
+        else:                                            # / , /12 , /3 , /4 , /5 ... 모두 같은 페이지(클라이언트 라우팅)
+            self._send(200, PAGE.replace("<!--CHARTJS-->", chart_js()), "text/html; charset=utf-8")
 
     def do_POST(self):
         try:
@@ -615,13 +613,14 @@ function renderApp(){
     return `<button class="${all}" onclick="selectOffice(${i})">${esc(o.name)}</button>`;
   }).join('');
   document.getElementById('foot').textContent='자료: 사내 일일 입출고 엑셀 (날짜 시트) · 입고/출고 마스터 시트 미사용 · 파일명 (영업N실)로 실 구분';
-  const want=new URLSearchParams(location.search).get('office');
+  const slug=location.pathname.replace(/\//g,'');
   let idx=0;
-  if(want){ const i=DATA.offices.findIndex(o=>o.name===want); if(i>=0) idx=i; }
+  if(slug){ const i=DATA.offices.findIndex(o=>officeSlug(o.name)===slug); if(i>=0) idx=i; }
   selectOffice(idx);
 }
 function selectOffice(i){
   OFFI=i; O=DATA.offices[i];
+  history.replaceState(null,'','/'+officeSlug(O.name));
   document.querySelectorAll('#offseg button').forEach((b,j)=>b.classList.toggle('on',j===i));
   renderOffice();
 }
@@ -635,7 +634,8 @@ function renderOffice(){
   buildEmailCard();
 }
 
-function officeLink(){ return location.origin+'/?office='+encodeURIComponent(O.name); }
+function officeSlug(name){ const d=(String(name).match(/\d/g)||[]).join(''); return d||'all'; }
+function officeLink(){ return location.origin+'/'+officeSlug(O.name); }
 function buildEmailCard(){
   document.getElementById('off-name').textContent=O.name;
   document.getElementById('officelink').textContent=officeLink();
