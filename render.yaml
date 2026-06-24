@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: daily-dashboard
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: DATA_DIR
+        value: /tmp
