@@ -361,9 +361,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        path = self.path.split("?")[0]                   # ?office=... 쿼리는 무시(클라이언트가 처리)
+        if path in ("/", "/index.html"):
             self._send(200, PAGE.replace("<!--CHARTJS-->", chart_js()), "text/html; charset=utf-8")
-        elif self.path == "/data":                       # 저장된 데이터(있으면)
+        elif path == "/data":                            # 저장된 데이터(있으면)
             if os.path.exists(DATA_FILE):
                 with open(DATA_FILE, encoding="utf-8") as f:
                     self._send(200, f.read())
@@ -543,7 +544,11 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
 
     <div class="card" id="smscard" style="margin-top:22px">
       <h2>📱 대시보드 링크 문자 발송 <span style="font-size:12px;color:var(--mut);font-weight:500">— 각 직원에게 자동으로 링크 전송</span></h2>
-      <p class="desc">받는 사람 휴대폰 번호를 넣고 발송하면, <b>이 대시보드 링크가 문자로 각 사람에게 자동 전송</b>됩니다. (여러 명은 줄바꿈·콤마·세미콜론으로 구분 · 한 번 넣으면 저장)</p>
+      <p class="desc">받는 사람 휴대폰 번호를 넣고 발송하면, <b>지금 보고 있는 실의 링크</b>가 문자로 각 사람에게 자동 전송됩니다. (실마다 링크·번호가 따로 — 줄바꿈·콤마·세미콜론 구분 · 저장됨)</p>
+      <div style="font-size:12.5px;color:#555;margin:0 0 12px;word-break:break-all;background:#f6f6f8;border-radius:9px;padding:9px 13px">
+        🔗 <b id="off-name"></b> 링크: <span id="officelink" style="color:var(--blue);font-weight:600"></span>
+        <button id="btn-copy" style="margin-left:6px;font-size:11.5px;border:1px solid var(--line);background:#fff;border-radius:7px;padding:3px 9px;cursor:pointer;font-family:inherit">복사</button>
+      </div>
       <textarea id="phonebox" rows="3" placeholder="010-1234-5678, 010-2222-3333, ..." style="width:100%;font-size:14px;padding:12px 14px;border:1.5px solid var(--line);border-radius:11px;font-family:inherit;outline:none;resize:vertical"></textarea>
       <div style="margin-top:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
         <button id="btn-sms" class="confirmbtn">📱 링크 문자 발송</button>
@@ -610,7 +615,10 @@ function renderApp(){
     return `<button class="${all}" onclick="selectOffice(${i})">${esc(o.name)}</button>`;
   }).join('');
   document.getElementById('foot').textContent='자료: 사내 일일 입출고 엑셀 (날짜 시트) · 입고/출고 마스터 시트 미사용 · 파일명 (영업N실)로 실 구분';
-  selectOffice(0);
+  const want=new URLSearchParams(location.search).get('office');
+  let idx=0;
+  if(want){ const i=DATA.offices.findIndex(o=>o.name===want); if(i>=0) idx=i; }
+  selectOffice(idx);
 }
 function selectOffice(i){
   OFFI=i; O=DATA.offices[i];
@@ -627,25 +635,32 @@ function renderOffice(){
   buildEmailCard();
 }
 
+function officeLink(){ return location.origin+'/?office='+encodeURIComponent(O.name); }
 function buildEmailCard(){
-  document.getElementById('phonebox').value = localStorage.getItem('staffPhones')||'';
+  document.getElementById('off-name').textContent=O.name;
+  document.getElementById('officelink').textContent=officeLink();
+  document.getElementById('phonebox').value = localStorage.getItem('phones_'+O.name)||'';
   document.getElementById('smsstatus').textContent='';
 }
+document.getElementById('btn-copy').onclick=()=>{
+  navigator.clipboard.writeText(officeLink()).then(()=>{
+    document.getElementById('smsstatus').textContent='✅ 링크 복사됨 — 카톡 등에 붙여넣기 가능';
+  });
+};
 document.getElementById('btn-sms').onclick=()=>{
   const st=document.getElementById('smsstatus');
   const raw=document.getElementById('phonebox').value.trim();
-  localStorage.setItem('staffPhones', raw);
+  localStorage.setItem('phones_'+O.name, raw);
   const numbers=[...new Set(raw.split(/[;,\s]+/).map(s=>s.trim()).filter(Boolean))];
   if(!numbers.length){ st.textContent='⚠️ 받는 휴대폰 번호를 입력하세요.'; return; }
-  const link=location.origin+'/';
   const day=O.days[CUR];
-  const text=`[입출고 대시보드] ${O.name} (${day.date})\n${link}`;
+  const text=`[입출고 대시보드] ${O.name} (${day.date})\n${officeLink()}`;
   st.textContent=`문자 발송 중… (${numbers.length}명)`;
   fetch('/sms',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({numbers, text})})
   .then(r=>r.json()).then(res=>{
     st.textContent = res.error ? ('오류: '+res.error)
-      : `✅ ${numbers.length}명에게 링크 문자를 발송했습니다.`;
+      : `✅ ${O.name} 링크를 ${numbers.length}명에게 문자 발송했습니다.`;
   }).catch(e=>{ st.textContent='전송 오류: '+e; });
 };
 
