@@ -8,3 +8,14 @@ services:
     envVars:
       - key: DATA_DIR
         value: /tmp
+      # 보내는 메일 계정(SMTP) — Render 대시보드 Environment 에서 값 입력 (코드/저장소엔 비번 안 둠)
+      - key: SMTP_HOST      # 예: smtp.gmail.com
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER      # 보내는 계정 (예: sean94kr@gmail.com)
+        sync: false
+      - key: SMTP_PASS      # Gmail 앱 비밀번호 16자리
+        sync: false
+      - key: MAIL_FROM      # 비우면 SMTP_USER 와 동일
+        sync: false
