@@ -346,6 +346,8 @@ def _e(s):
 
 CONTACT_NAME = "유니트론텍 안성우 책임"
 CONTACT_MAIL = "sw.ahn@unitrontech.com"
+# 받는 사람 메일함에 보이는 발신자 이름. 없으면 메일주소가 그대로 노출된다.
+FROM_NAME = os.environ.get("MAIL_FROM_NAME", "유니트론텍 입출고 대시보드")
 
 
 def compose_email_html(office, date, day=None, link=""):
@@ -387,12 +389,14 @@ def _send_smtp(emails, subject, body, cfg):
     from email.mime.text import MIMEText
     host, port = cfg["host"], cfg["port"]
     user, pw, sender = cfg["user"], cfg["pw"], cfg["sender"]
+    from email.utils import formataddr
     msg = MIMEText(body, "html", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = sender
+    # 메일주소 대신 이름으로 보이게 (한글은 RFC2047 로 자동 인코딩됨)
+    msg["From"] = formataddr((FROM_NAME, sender)) if FROM_NAME else sender
     msg["To"] = ", ".join(emails)
     # 답장은 발송용 계정이 아니라 문의처로 가야 한다
-    msg["Reply-To"] = CONTACT_MAIL
+    msg["Reply-To"] = formataddr((CONTACT_NAME, CONTACT_MAIL))
     with smtplib.SMTP(host, port, timeout=25) as s:
         s.ehlo()
         try:
