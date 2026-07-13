@@ -468,10 +468,13 @@ def export_xlsx(payload):
                sorted(inv["items"], key=lambda x: -x["qty"])],
               widths=[26, 16, 16, 12, 10, 10, 18, 12, 12, 12, 12, 11],
               red_col=11)
-        sheet("노후화", f"재고 노후화 (Datecode) · {office}",
-              ["연도", "품목 수", "수량"],
-              [[d["year"], d["items"], d["qty"]] for d in inv["datecode"]],
-              widths=[10, 12, 16])
+        # Datecode 는 영업1,2실에만 채워져 있다 → 있는 실에서만 시트를 만든다
+        dc = [d for d in inv["datecode"] if d["qty"] > 0]
+        if dc:
+            sheet("노후화", f"재고 노후화 (Datecode) · {office}",
+                  ["연도", "품목 수", "수량"],
+                  [[d["year"], d["items"], d["qty"]] for d in dc],
+                  widths=[10, 12, 16])
         sheet("MOBIS별", f"MOBIS ID별 · {office}",
               ["MOBIS ID", "품목 수", "수량"],
               [[m["name"], m["items"], m["qty"]] for m in inv["by_family"]],
@@ -1126,8 +1129,9 @@ function renderApp(){
     selectOffice(idx);
   }
   if(hasInv){
-    const names=Object.keys(INVS);
-    INVK=names.includes('전체 합계')?'전체 합계':names[0];
+    // 재고는 실별로 보는 게 기본. '전체 합계'는 버튼으로 따로 볼 수 있게 둔다.
+    const names=Object.keys(INVS).filter(n=>n!=='전체 합계');
+    INVK=names[0]||'전체 합계';
     renderInventory();
   }
   showView(hasIO?'io':'inv');
@@ -1394,17 +1398,18 @@ function renderInventory(){
   document.getElementById('inv-foot').textContent=
     `자료: 재고 엑셀의 '${I.sheet}' 시트 · 재고 수량이 있는 품목만 집계 (합계 행 제외) · 장기재고 = Datecode ${I.old_year}년 이전`;
 
+  // 노후화(Datecode)는 영업1,2실에만 데이터가 있다. 없는 실에서는 관련 요소를 아예 뺀다.
   const hasDC=I.datecode.some(d=>d.qty>0);
   document.getElementById('inv-kpis').innerHTML=[
     ['it','재고 품목',fmt(I.n_items),'건'],
     ['in','총 재고',fmt(I.total_qty),'EA'],
     ['av','가용 재고',fmt(I.avail_qty),'EA'],
     ['bk','예약(booking)',fmt(I.booking_qty),'EA'],
-    // Datecode 가 없는 실에서 '장기재고 0'은 '장기재고가 없다'로 오해된다 → 정보없음으로 표시
-    ['old',`장기재고 (${I.old_year}년 이전)`, hasDC?fmt(I.old_qty):'정보없음', hasDC?'EA':''],
+    hasDC ? ['old',`장기재고 (${I.old_year}년 이전)`,fmt(I.old_qty),'EA']
+          : ['it','당월 입고',fmt(I.month.inbound),'EA'],
     ['cu','당월 출고',fmt(I.month.outbound),'EA'],
   ].map(([c,l,v,u])=>`<div class="kpi ${c}"><div class="l">${l}</div>
-     <div class="v tab"${v==='정보없음'?' style="font-size:17px;color:#aaa"':''}>${v}<span class="u">${u}</span></div></div>`).join('');
+     <div class="v tab">${v}<span class="u">${u}</span></div></div>`).join('');
 
   const hl=document.getElementById('inv-hl');
   if(hasDC && I.old_qty>0){
@@ -1412,11 +1417,6 @@ function renderInventory(){
     hl.innerHTML=`<span class="tag">장기재고</span><div class="txt">
       Datecode <b>${I.old_year}년 이전</b> 재고가 <span class="q">${fmt(I.old_qty)} EA</span>
       — 전체 재고의 <b>${pct(I.old_qty,I.total_qty)}%</b></div>`;
-  }else if(!hasDC){
-    hl.style.display='flex';
-    hl.innerHTML=`<span class="tag" style="background:#8a8a92">정보없음</span><div class="txt">
-      이 영업실 재고 시트에는 <b>Datecode 열이 비어 있어</b> 노후화를 계산할 수 없습니다.
-      장기재고 판단이 필요하면 원본 엑셀에 Datecode를 채워 주세요.</div>`;
   }else hl.style.display='none';
 
   Object.values(ICH).forEach(c=>c&&c.destroy()); ICH={};
@@ -1449,7 +1449,7 @@ function renderInventory(){
 
     if(sal.length){
       T.textContent='담당자별 재고';
-      DSC.innerHTML='이 영업실은 <b>Datecode 정보가 없어</b> 노후화를 계산할 수 없습니다 — 담당자별 재고로 대체';
+      DSC.innerHTML='수량 기준 상위';
       ICH.age=new Chart(document.getElementById('cAge'),{type:'bar',
         data:{labels:sal.map(s=>s[0]),datasets:[{data:sal.map(s=>s[1]),
           backgroundColor:BLUE,borderRadius:5,maxBarThickness:22}]},
@@ -1461,7 +1461,7 @@ function renderInventory(){
     }else{
       const top=[...I.items].sort((a,b)=>b.qty-a.qty).slice(0,8);
       T.textContent='재고 상위 품목';
-      DSC.innerHTML='이 영업실은 <b>Datecode·담당 정보가 없어</b> 노후화를 계산할 수 없습니다 — 재고 상위 품목으로 대체';
+      DSC.innerHTML='수량 기준 상위';
       ICH.age=new Chart(document.getElementById('cAge'),{type:'bar',
         data:{labels:top.map(x=>x.part),datasets:[{data:top.map(x=>x.qty),
           backgroundColor:BLUE,borderRadius:5,maxBarThickness:22}]},
@@ -1538,9 +1538,9 @@ function renderInventory(){
   }else{ grid.style.display='none'; }
 
   document.getElementById('in-all').textContent=I.items.length;
-  document.getElementById('in-old').textContent=hasDC?I.items.filter(x=>x.old>0).length:'—';
-  document.getElementById('ib-old').disabled=!hasDC;
-  document.getElementById('ib-old').title=hasDC?'':'Datecode 정보가 없어 장기재고를 계산할 수 없습니다';
+  document.getElementById('in-old').textContent=I.items.filter(x=>x.old>0).length;
+  // 장기재고 탭은 Datecode 가 있는 실(영업1,2실)에서만 보여준다
+  document.getElementById('ib-old').style.display=hasDC?'':'none';
   document.getElementById('in-bk').textContent=I.items.filter(x=>x.booking>0).length;
   if(!hasDC && ITAB==='old') ITAB='all';
   document.getElementById('invq').oninput=()=>drawInvTable();
@@ -1566,10 +1566,12 @@ function drawInvTable(){
 
   const el=document.getElementById('invtable');
   if(!rows.length){ el.innerHTML=emptyMsg(); return; }
+  // 장기재고/Datecode 칼럼은 데이터가 있는 실에서만 (영업1,2실)
+  const dc=I.datecode.some(d=>d.qty>0);
   el.innerHTML=`<table><thead><tr><th>#</th><th>PART#</th><th>MOBIS ID</th><th>FAMILY</th>
     <th>실</th><th class="n">재고</th><th class="n">가용</th><th class="n">예약</th>
-    <th class="n">장기재고</th><th>Datecode</th><th>담당</th></tr></thead><tbody>${
-    rows.map((x,i)=>`<tr class="${x.old>0?'oldrow':''}">
+    ${dc?'<th class="n">장기재고</th><th>Datecode</th>':''}<th>담당</th></tr></thead><tbody>${
+    rows.map((x,i)=>`<tr class="${dc&&x.old>0?'oldrow':''}">
       <td class="n">${i+1}</td>
       <td class="part">${esc(x.part)}</td>
       <td>${esc(x.mobis)||'—'}</td>
@@ -1578,8 +1580,8 @@ function drawInvTable(){
       <td class="qty">${fmt(x.qty)}</td>
       <td class="n">${fmt(x.avail)}</td>
       <td class="n">${x.booking?fmt(x.booking):'—'}</td>
-      <td class="n ${x.old>0?'old':''}">${x.old?fmt(x.old):'—'}</td>
-      <td>${x.oldest?('<span class="pill">'+x.oldest+'~</span>'):'—'}</td>
+      ${dc?`<td class="n ${x.old>0?'old':''}">${x.old?fmt(x.old):'—'}</td>
+      <td>${x.oldest?('<span class="pill">'+x.oldest+'~</span>'):'—'}</td>`:''}
       <td>${esc(x.sales)||'—'}</td></tr>`).join('')}</tbody></table>`;
 }
 </script></body></html>"""
