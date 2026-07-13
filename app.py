@@ -1220,27 +1220,26 @@ function renderApp(){
   document.getElementById('foot').textContent='자료: 사내 일일 입출고 엑셀 (날짜 시트) · 입고/출고 마스터 시트 미사용 · 파일명 (영업N실)로 실 구분';
 
   INVS=DATA.inventories||{};
-  // 실 페이지에서는 자기 실 재고만 남긴다 — 다른 실 재고는 목록에도 없다.
-  // 루트(/)에서만 실 선택 버튼이 나온다.
-  INVNAMES=Object.keys(INVS);
-  if(URLSLUG) INVNAMES=INVNAMES.filter(n=>officeSlug(n)===URLSLUG);
+  const hasIO=DATA.offices && DATA.offices.length;
 
-  const hasIO=DATA.offices && DATA.offices.length, hasInv=INVNAMES.length>0;
-  document.getElementById('viewnav').style.display=(hasIO||hasInv)?'block':'none';
-  document.getElementById('vw-io').style.display=hasIO?'':'none';
-  document.getElementById('vw-inv').style.display=hasInv?'':'none';
-
+  // 입출고에서 볼 실을 먼저 정한다 (URL 슬러그 → 없으면 첫 실)
   if(hasIO){
     let idx=0;
     if(URLSLUG){ const i=DATA.offices.findIndex(o=>officeSlug(o.name)===URLSLUG); if(i>=0) idx=i; }
     selectOffice(idx);
   }
-  if(hasInv){
-    // 재고는 실별로 보는 게 기본. '전체 합계'는 루트에서 버튼으로만 볼 수 있다.
-    const pref=INVNAMES.filter(n=>n!=='전체 합계');
-    INVK=pref[0]||INVNAMES[0];
-    renderInventory();
-  }
+
+  // 재고는 지금 보고 있는 그 실 것만 본다. 다른 실 재고는 목록에도 없고 버튼도 없다.
+  const slug=hasIO?officeSlug(O.name):URLSLUG;
+  INVNAMES=Object.keys(INVS).filter(n=>officeSlug(n)===slug);
+  if(!INVNAMES.length && !slug) INVNAMES=Object.keys(INVS).slice(0,1);   // 재고만 올린 경우
+  const hasInv=INVNAMES.length>0;
+
+  document.getElementById('viewnav').style.display=(hasIO||hasInv)?'block':'none';
+  document.getElementById('vw-io').style.display=hasIO?'':'none';
+  document.getElementById('vw-inv').style.display=hasInv?'':'none';
+
+  if(hasInv){ INVK=INVNAMES[0]; renderInventory(); }
   showView(hasIO?'io':(hasInv?'inv':'io'));
 }
 
@@ -1497,20 +1496,10 @@ function renderInventory(){
   const I=INVS[INVK];
   if(!I) return;
 
-  // 실 선택 버튼. 실 페이지에서는 볼 수 있는 실이 자기 실 하나뿐이라 버튼도 하나 (누를 수 없음).
-  const seg=document.getElementById('inv-offseg');
-  if(INVNAMES.length<2){
-    seg.innerHTML=`<span class="lab">영업실</span>`+
-      `<button class="on" style="cursor:default" disabled>${esc(INVK)}</button>`;
-  }else{
-    const names=INVNAMES.slice().sort((a,b)=>
-      (a==='전체 합계'?-1:0)-(b==='전체 합계'?-1:0));
-    seg.innerHTML='<span class="lab">영업실</span>'+names.map(n=>{
-      const all=n==='전체 합계'?' all':'';
-      const on=n===INVK?' on':'';
-      return `<button class="${all}${on}" onclick="selectInv('${n.replace(/'/g,"\\'")}')">${esc(n)}</button>`;
-    }).join('');
-  }
+  // 보고 있는 실 하나만 — 다른 실로 가는 버튼은 없다 (입출고 쪽과 동일)
+  document.getElementById('inv-offseg').innerHTML=
+    `<span class="lab">영업실</span>`+
+    `<button class="on" style="cursor:default" disabled>${esc(INVK)}</button>`;
 
   document.getElementById('inv-foot').textContent=
     `자료: 재고 엑셀의 '${I.sheet}' 시트 · 재고 수량이 있는 품목만 집계 (합계 행 제외) · 장기재고 = Datecode ${I.old_year}년 이전`;
