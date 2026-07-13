@@ -124,6 +124,133 @@ def parse_workbook(wb):
     return per
 
 
+# ---------------------------------------------------------------- 재고 현황
+OLD_YEAR = 2022          # 이 해 이전 datecode = 장기 재고
+
+
+def inventory_sheet(wb):
+    """'Jul inventory' 처럼 이름이 inventory 로 끝나는 시트를 찾는다."""
+    for s in wb.sheetnames:
+        if s.strip().lower().endswith("inventory"):
+            return wb[s]
+    return None
+
+
+def parse_inventory(ws):
+    """재고 시트 → 대시보드용 집계. 헤더는 2행, 데이터는 3행부터."""
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+    if len(rows) < 3:
+        return None
+    hdr = [clean(h) for h in rows[1]]
+    i_part = next((i for i, h in enumerate(hdr)
+                   if h.replace(" ", "").upper() == "PART#"), -1)
+    if i_part < 0:
+        return None
+    # 시트 하단에 Part# 없는 합계 행이 섞여 있다. 그대로 더하면 정확히 2배가 된다.
+    data = [r for r in rows[2:] if r and i_part < len(r) and clean(r[i_part])]
+
+    def idx(*names):
+        for n in names:
+            for i, h in enumerate(hdr):
+                if h.replace(" ", "").upper() == n.replace(" ", "").upper():
+                    return i
+        return -1
+
+    C = dict(
+        office=idx("Sales team"), central=idx("Central"), vender=idx("VENDER"),
+        family=idx("FAMILY"), part=idx("Part#"), mobis=idx("MOBIS ID"),
+        pn=idx("품번"), qty=idx("Q'ty"), avail=idx("available Q'ty"),
+        booking=idx("booking"), customer=idx("CUSTOMER"), sales=idx("SALES"),
+        crd=idx("CRD"),
+    )
+    if C["part"] < 0 or C["qty"] < 0:
+        return None
+
+    # Datecode 연도 컬럼 (헤더에 4자리 연도가 들어있음)
+    years = {}
+    for i, h in enumerate(hdr):
+        if "DATECODE" in h.upper():
+            m = re.search(r"(20\d{2})", h)
+            if m:
+                years[int(m.group(1))] = i
+
+    # 일별 컬럼: '1일'~'31일' 이 두 번 반복 (앞 31개=입고, 뒤 31개=출고)
+    days = [i for i, h in enumerate(hdr) if re.fullmatch(r"\d{1,2}일", h)]
+    d_in, d_out = days[:31], days[31:62]
+    i_prev = idx("전월")
+
+    def g(r, key):
+        i = C[key]
+        return r[i] if 0 <= i < len(r) else None
+
+    items, tot_q, tot_a, tot_b = [], 0.0, 0.0, 0.0
+    by = {k: defaultdict(lambda: [0, 0.0]) for k in ("office", "vender", "family")}
+    dc = {y: [0, 0.0] for y in years}
+    cust_bk = defaultdict(float)
+
+    for r in data:
+        if not r or not clean(g(r, "part")):
+            continue
+        q = to_num(g(r, "qty"))
+        if q <= 0:                                  # 재고 없는 품목은 제외
+            continue
+        a = to_num(g(r, "avail"))
+        b = to_num(g(r, "booking"))
+        tot_q += q; tot_a += a; tot_b += b
+
+        for k in ("office", "vender", "family"):
+            key = clean(g(r, k)) or "(미지정)"
+            by[k][key][0] += 1
+            by[k][key][1] += q
+
+        old_q, oldest = 0.0, None
+        for y, ci in years.items():
+            v = to_num(r[ci]) if ci < len(r) else 0.0
+            if v > 0:
+                dc[y][0] += 1; dc[y][1] += v
+                if y <= OLD_YEAR:
+                    old_q += v
+                if oldest is None or y < oldest:
+                    oldest = y
+
+        c = clean(g(r, "customer"))
+        if c and c != "." and b:
+            cust_bk[c] += b
+
+        items.append(dict(
+            part=clean(g(r, "part")), mobis=clean(g(r, "mobis")),
+            pn=clean(g(r, "pn")), family=clean(g(r, "family")),
+            vender=clean(g(r, "vender")), office=clean(g(r, "office")),
+            sales=clean(g(r, "sales")), customer=c, crd=clean(g(r, "crd")),
+            qty=q, avail=a, booking=b, old=old_q, oldest=oldest,
+        ))
+
+    def top(k):
+        return [dict(name=n, items=v[0], qty=v[1])
+                for n, v in sorted(by[k].items(), key=lambda x: -x[1][1])]
+
+    daily_in = [sum(to_num(r[i]) for r in data if i < len(r)) for i in d_in]
+    daily_out = [sum(to_num(r[i]) for r in data if i < len(r)) for i in d_out]
+
+    return dict(
+        sheet=ws.title,
+        n_items=len(items),
+        total_qty=tot_q, avail_qty=tot_a, booking_qty=tot_b,
+        old_qty=sum(v[1] for y, v in dc.items() if y <= OLD_YEAR),
+        old_year=OLD_YEAR,
+        by_office=top("office"), by_vender=top("vender"), by_family=top("family"),
+        datecode=[dict(year=y, items=dc[y][0], qty=dc[y][1]) for y in sorted(dc)],
+        month=dict(
+            prev=sum(to_num(r[i_prev]) for r in data if 0 <= i_prev < len(r)),
+            inbound=sum(daily_in), outbound=sum(daily_out),
+            daily_in=daily_in, daily_out=daily_out,
+        ),
+        customers=[dict(name=n, booking=v)
+                   for n, v in sorted(cust_bk.items(), key=lambda x: -x[1])[:12]],
+        items=items,
+    )
+
+
 def day_block(date, inbound, outbound):
     cust = defaultdict(lambda: [0.0, 0])
     for r in outbound:
@@ -175,27 +302,41 @@ def office_block(name, per):
 
 
 def build_payload(files, password):
-    """files: [{name, file(base64)}] → {offices:[...]} (실별 + 전체 합계)."""
-    offices = []
+    """files: [{name, file(base64)}] → {offices:[...], inventory:{...}}
+
+    파일 종류는 시트 이름으로 자동 판별한다.
+      날짜 시트(YYYY-MM-DD) 있음  → 일일 입출고 파일
+      '~ inventory' 시트 있음      → 재고 현황 파일
+    """
+    offices, inventory = [], None
     allbydate = defaultdict(lambda: ([], []))
     for f in files:
         b64 = f["file"]
         if "," in b64[:64]:
             b64 = b64.split(",", 1)[1]
         wb = open_wb(base64.b64decode(b64), password)
-        per = parse_workbook(wb)
-        wb.close()
-        if not per:
-            continue
-        offices.append(office_block(f.get("name") or "실", per))
-        for d, (inb, outb) in per.items():
-            allbydate[d][0].extend(inb); allbydate[d][1].extend(outb)
-    if not offices:
-        raise ValueError("날짜 시트(YYYY-MM-DD)가 있는 파일을 찾지 못했습니다.")
+        try:
+            per = parse_workbook(wb)
+            if per:                                     # 입출고 파일
+                offices.append(office_block(f.get("name") or "실", per))
+                for d, (inb, outb) in per.items():
+                    allbydate[d][0].extend(inb); allbydate[d][1].extend(outb)
+                continue
+            ws = inventory_sheet(wb)                    # 재고 파일
+            if ws is not None:
+                inv = parse_inventory(ws)
+                if inv:
+                    inventory = inv
+        finally:
+            wb.close()
+
+    if not offices and not inventory:
+        raise ValueError("날짜 시트(YYYY-MM-DD)가 있는 입출고 파일이나 "
+                         "'inventory' 시트가 있는 재고 파일을 찾지 못했습니다.")
     if len(offices) > 1:                            # 전체 합계 탭 (맨 앞)
         agg = {d: (allbydate[d][0], allbydate[d][1]) for d in allbydate}
         offices.insert(0, office_block("전체 합계", agg))
-    return dict(offices=offices)
+    return dict(offices=offices, inventory=inventory)
 
 
 # ---------------------------------------------------------------- 이메일 (Outlook)
@@ -459,6 +600,13 @@ header .reload{position:absolute;right:40px;top:30px;background:rgba(255,255,255
 .kpi:hover{transform:translateY(-3px);}
 .kpi::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--c,var(--ink));}
 .kpi.in{--c:var(--blue);} .kpi.out{--c:var(--red);} .kpi.net{--c:var(--green);} .kpi.cu{--c:var(--amber);}
+.kpi.old{--c:var(--red);} .kpi.av{--c:var(--green);} .kpi.bk{--c:var(--amber);} .kpi.it{--c:var(--blue);}
+/* 뷰 전환 (입출고 / 재고) */
+.viewseg{display:inline-flex;background:#e9e9ef;border-radius:12px;padding:4px;gap:4px;margin-bottom:4px;}
+.viewseg button{border:none;background:transparent;font-family:inherit;font-size:14px;font-weight:800;color:#777;padding:10px 22px;border-radius:9px;cursor:pointer;transition:.15s;}
+.viewseg button.on{background:#fff;color:var(--ink);box-shadow:0 2px 8px rgba(0,0,0,.12);}
+tr.oldrow td{background:#fdf1f1;}
+td.old{color:var(--red);font-weight:800;}
 .kpi .l{font-size:11.5px;color:var(--mut);font-weight:600;}
 .kpi .v{font-size:25px;font-weight:900;margin-top:8px;letter-spacing:-.6px;line-height:1;}
 .kpi .u{font-size:12px;font-weight:600;color:var(--mut);margin-left:2px;}
@@ -521,7 +669,14 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     <h1 id="h-date">—</h1>
     <div class="meta" id="h-meta"></div>
   </header>
-  <div class="wrap">
+  <div class="wrap" id="viewnav" style="display:none;padding-bottom:0">
+    <div class="viewseg">
+      <button class="on" id="vw-io" onclick="showView('io')">📦 일일 입출고</button>
+      <button id="vw-inv" onclick="showView('inv')">📊 재고 현황</button>
+    </div>
+  </div>
+
+  <div class="wrap" id="ioview">
     <div class="offseg" id="offseg"></div>
     <div class="dayseg" id="dayseg"></div>
     <div class="kpis" id="kpis"></div>
@@ -554,6 +709,39 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       </div>
     </div>
     <div class="foot" id="foot"></div>
+  </div>
+
+  <!-- ================= 재고 현황 ================= -->
+  <div class="wrap" id="invview" style="display:none">
+    <div class="kpis" id="inv-kpis"></div>
+    <div class="hl" id="inv-hl" style="display:none"></div>
+    <div class="grid">
+      <div class="card"><h2>재고 노후화 (Datecode 연도별)</h2>
+        <p class="desc"><span id="inv-oldlabel">—</span>년 이전 = 장기재고 (빨강) · 연도별 편차가 커서 <b>로그 스케일</b> — 막대 길이를 그대로 비교하지 마세요</p>
+        <div class="cbox"><canvas id="cAge"></canvas></div></div>
+      <div class="card"><h2>FAMILY별 재고</h2><p class="desc">수량 기준 상위</p>
+        <div class="cbox"><canvas id="cFam"></canvas></div></div>
+    </div>
+    <div class="grid">
+      <div class="card"><h2>당월 일별 입출고</h2><p class="desc">재고 시트 기준</p>
+        <div class="cbox"><canvas id="cMon"></canvas></div></div>
+      <div class="card"><h2>고객사 예약(booking)</h2><p class="desc">예약 수량 상위</p>
+        <div class="cbox"><canvas id="cBook"></canvas></div></div>
+    </div>
+
+    <div class="tabs">
+      <button class="tabbtn on" id="ib-all" onclick="showInvTab('all')">전체 품목<span class="n" id="in-all"></span></button>
+      <button class="tabbtn" id="ib-old" onclick="showInvTab('old')">장기재고<span class="n" id="in-old"></span></button>
+      <button class="tabbtn" id="ib-bk" onclick="showInvTab('bk')">예약분<span class="n" id="in-bk"></span></button>
+    </div>
+    <div class="tablewrap">
+      <div style="padding:12px 16px;border-bottom:1px solid var(--line)">
+        <input id="invq" placeholder="Part# / MOBIS ID / FAMILY / 담당 검색…"
+          style="width:100%;max-width:420px;font-size:13.5px;padding:9px 13px;border:1.5px solid var(--line);border-radius:10px;font-family:inherit;outline:none">
+      </div>
+      <div class="scroll" id="invtable"></div>
+    </div>
+    <div class="foot" id="inv-foot"></div>
   </div>
 </div>
 
@@ -609,10 +797,32 @@ function renderApp(){
   document.getElementById('land').style.display='none';
   document.getElementById('dash').style.display='block';
   document.getElementById('foot').textContent='자료: 사내 일일 입출고 엑셀 (날짜 시트) · 입고/출고 마스터 시트 미사용 · 파일명 (영업N실)로 실 구분';
-  const slug=location.pathname.replace(/\//g,'');
-  let idx=0;
-  if(slug){ const i=DATA.offices.findIndex(o=>officeSlug(o.name)===slug); if(i>=0) idx=i; }
-  selectOffice(idx);
+
+  const hasIO=DATA.offices && DATA.offices.length, hasInv=!!DATA.inventory;
+  // 두 종류가 다 올라왔을 때만 전환 버튼을 보여준다
+  document.getElementById('viewnav').style.display=(hasIO&&hasInv)?'block':'none';
+
+  if(hasIO){
+    const slug=location.pathname.replace(/\//g,'');
+    let idx=0;
+    if(slug){ const i=DATA.offices.findIndex(o=>officeSlug(o.name)===slug); if(i>=0) idx=i; }
+    selectOffice(idx);
+  }
+  if(hasInv) renderInventory();
+  showView(hasIO?'io':'inv');
+}
+
+function showView(v){
+  const io=v==='io';
+  document.getElementById('ioview').style.display=io?'block':'none';
+  document.getElementById('invview').style.display=io?'none':'block';
+  document.getElementById('vw-io').classList.toggle('on',io);
+  document.getElementById('vw-inv').classList.toggle('on',!io);
+  if(!io){
+    const I=DATA.inventory;
+    document.getElementById('h-date').innerHTML=`재고 현황 <span class="d">·</span> ${esc(I.sheet)}`;
+    document.getElementById('h-meta').textContent=`품목 ${fmt(I.n_items)}건 · 총 재고 ${fmt(I.total_qty)} EA`;
+  }else if(O){ showDay(CUR); }
 }
 function buildOffseg(){
   const seg=document.getElementById('offseg');
@@ -767,6 +977,121 @@ function showTab(which){
   document.getElementById('tb-out').classList.toggle('on',which==='out');
   document.getElementById('tb-in').classList.toggle('on',which==='in');
   document.getElementById('tablearea').innerHTML=TB[which]||'';
+}
+
+// ================= 재고 현황 =================
+let ICH={}, ITAB='all';
+const pct=(a,b)=>b?Math.round(a/b*1000)/10:0;
+
+function renderInventory(){
+  const I=DATA.inventory;
+  document.getElementById('inv-oldlabel').textContent=I.old_year;
+  document.getElementById('inv-foot').textContent=
+    `자료: 재고 엑셀의 '${I.sheet}' 시트 · 재고 수량이 있는 품목만 집계 (합계 행 제외) · 장기재고 = Datecode ${I.old_year}년 이전`;
+
+  document.getElementById('inv-kpis').innerHTML=[
+    ['it','재고 품목',I.n_items,'건'],
+    ['in','총 재고',I.total_qty,'EA'],
+    ['av','가용 재고',I.avail_qty,'EA'],
+    ['bk','예약(booking)',I.booking_qty,'EA'],
+    ['old',`장기재고 (${I.old_year}년 이전)`,I.old_qty,'EA'],
+    ['cu','당월 출고',I.month.outbound,'EA'],
+  ].map(([c,l,v,u])=>`<div class="kpi ${c}"><div class="l">${l}</div>
+     <div class="v tab">${fmt(v)}<span class="u">${u}</span></div></div>`).join('');
+
+  const hl=document.getElementById('inv-hl');
+  if(I.old_qty>0){
+    hl.style.display='flex';
+    hl.innerHTML=`<span class="tag">장기재고</span><div class="txt">
+      Datecode <b>${I.old_year}년 이전</b> 재고가 <span class="q">${fmt(I.old_qty)} EA</span>
+      — 전체 재고의 <b>${pct(I.old_qty,I.total_qty)}%</b></div>`;
+  }else hl.style.display='none';
+
+  Object.values(ICH).forEach(c=>c&&c.destroy()); ICH={};
+
+  // 재고 노후화 — 장기재고는 빨강
+  // 2026년 재고가 2019년의 50배라 선형 축에서는 장기재고 막대가 안 보인다 → 로그 스케일
+  const dc=I.datecode.filter(d=>d.qty>0);
+  ICH.age=new Chart(document.getElementById('cAge'),{type:'bar',
+    data:{labels:dc.map(d=>d.year),datasets:[{data:dc.map(d=>d.qty),
+      backgroundColor:dc.map(d=>d.year<=I.old_year?RED:BLUE),borderRadius:6,maxBarThickness:52}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{
+        label:c=>fmt(c.raw)+' EA ('+dc[c.dataIndex].items+'품목) · 전체의 '
+                 +pct(c.raw,I.total_qty)+'%'}}},
+      scales:{y:{type:'logarithmic',grid:{color:'#f0f0f3'},
+                 ticks:{callback:v=>{const s=String(v);
+                   return /^[125]0*$/.test(s)?fmt(v):'';}}},
+              x:{grid:{display:false}}}}});
+
+  const fam=I.by_family.slice(0,8);
+  ICH.fam=new Chart(document.getElementById('cFam'),{type:'bar',
+    data:{labels:fam.map(f=>f.name||'(미지정)'),datasets:[{data:fam.map(f=>f.qty),
+      backgroundColor:BLUE,borderRadius:5,maxBarThickness:22}]},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{
+        label:c=>fmt(c.raw)+' EA ('+fam[c.dataIndex].items+'품목)'}}},
+      scales:{x:{grid:{color:'#f0f0f3'},ticks:{callback:v=>fmt(v)}},y:{grid:{display:false}}}}});
+
+  const days=I.month.daily_in.map((_,i)=>i+1);
+  ICH.mon=new Chart(document.getElementById('cMon'),{type:'bar',
+    data:{labels:days,datasets:[
+      {label:'입고',data:I.month.daily_in,backgroundColor:BLUE,borderRadius:3,maxBarThickness:14},
+      {label:'출고',data:I.month.daily_out,backgroundColor:RED,borderRadius:3,maxBarThickness:14},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{position:'bottom',labels:{usePointStyle:true,boxWidth:8,padding:16}},
+        tooltip:{callbacks:{label:c=>c.dataset.label+': '+fmt(c.raw)+' EA'}}},
+      scales:{y:{grid:{color:'#f0f0f3'},ticks:{callback:v=>fmt(v)}},x:{grid:{display:false}}}}});
+
+  const bk=I.customers.slice(0,8);
+  ICH.book=new Chart(document.getElementById('cBook'),{type:'bar',
+    data:{labels:bk.map(c=>c.name),datasets:[{data:bk.map(c=>c.booking),
+      backgroundColor:AMBER,borderRadius:5,maxBarThickness:22}]},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>fmt(c.raw)+' EA'}}},
+      scales:{x:{grid:{color:'#f0f0f3'},ticks:{callback:v=>fmt(v)}},y:{grid:{display:false}}}}});
+
+  document.getElementById('in-all').textContent=I.items.length;
+  document.getElementById('in-old').textContent=I.items.filter(x=>x.old>0).length;
+  document.getElementById('in-bk').textContent=I.items.filter(x=>x.booking>0).length;
+  document.getElementById('invq').oninput=()=>drawInvTable();
+  showInvTab('all');
+}
+
+function showInvTab(t){
+  ITAB=t;
+  ['all','old','bk'].forEach(k=>document.getElementById('ib-'+k).classList.toggle('on',k===t));
+  drawInvTable();
+}
+
+function drawInvTable(){
+  const I=DATA.inventory;
+  const q=(document.getElementById('invq').value||'').trim().toUpperCase();
+  let rows=I.items;
+  if(ITAB==='old') rows=rows.filter(x=>x.old>0);
+  if(ITAB==='bk')  rows=rows.filter(x=>x.booking>0);
+  if(q) rows=rows.filter(x=>[x.part,x.mobis,x.family,x.sales,x.customer,x.pn]
+      .some(v=>String(v||'').toUpperCase().includes(q)));
+  rows=[...rows].sort((a,b)=>b.qty-a.qty);
+
+  const el=document.getElementById('invtable');
+  if(!rows.length){ el.innerHTML=emptyMsg(); return; }
+  el.innerHTML=`<table><thead><tr><th>#</th><th>PART#</th><th>MOBIS ID</th><th>FAMILY</th>
+    <th>실</th><th class="n">재고</th><th class="n">가용</th><th class="n">예약</th>
+    <th class="n">장기재고</th><th>Datecode</th><th>담당</th></tr></thead><tbody>${
+    rows.map((x,i)=>`<tr class="${x.old>0?'oldrow':''}">
+      <td class="n">${i+1}</td>
+      <td class="part">${esc(x.part)}</td>
+      <td>${esc(x.mobis)||'—'}</td>
+      <td>${esc(x.family)||'—'}</td>
+      <td>${esc(x.office)||'—'}</td>
+      <td class="qty">${fmt(x.qty)}</td>
+      <td class="n">${fmt(x.avail)}</td>
+      <td class="n">${x.booking?fmt(x.booking):'—'}</td>
+      <td class="n ${x.old>0?'old':''}">${x.old?fmt(x.old):'—'}</td>
+      <td>${x.oldest?('<span class="pill">'+x.oldest+'~</span>'):'—'}</td>
+      <td>${esc(x.sales)||'—'}</td></tr>`).join('')}</tbody></table>`;
 }
 </script></body></html>"""
 
