@@ -352,7 +352,7 @@ def compose_email_html(office, date, day=None, link=""):
     """메일 본문 — 대시보드 링크와 문의처만. (요약·내역표는 대시보드에서 본다)"""
     btn = (f'<a href="{_e(link)}" style="display:inline-block;background:#c43a3a;color:#fff;'
            f'text-decoration:none;font-weight:800;font-size:15px;padding:14px 28px;'
-           f'border-radius:10px">대시보드 열기 →</a>'
+           f'border-radius:10px">입출고 및 재고현황 조회 →</a>'
            f'<div style="font-size:12px;color:#999;margin-top:12px;word-break:break-all">{_e(link)}</div>'
            ) if link else '<div style="color:#999">링크 없음</div>'
 
