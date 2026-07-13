@@ -465,7 +465,7 @@ def send_email(payload):
     date = payload.get("date", "")
     day = payload.get("day") or {}
     link = payload.get("link", "")
-    subject = f"[입출고 대시보드] {office} · {date}"
+    subject = f"[입출고 및 재고현황 {date}]"
     body = compose_email_html(office, date, day, link)
     cfg = resolve_smtp(payload.get("smtp"))
     if cfg:                                             # SMTP (요청 설정 또는 환경변수)
