@@ -876,6 +876,32 @@ td.old{color:var(--red);font-weight:800;}
 .hl{background:linear-gradient(110deg,#fff,#fff7f4);border:1px solid #f3dcdc;border-radius:16px;padding:16px 20px;margin-bottom:24px;display:flex;align-items:center;gap:16px;box-shadow:0 4px 18px rgba(196,58,58,.06);}
 .hl .tag{background:var(--red);color:#fff;font-size:11px;font-weight:800;padding:5px 11px;border-radius:8px;white-space:nowrap;}
 .hl .txt{font-size:14px;} .hl .txt b{font-weight:800;} .hl .txt .q{color:var(--red);font-weight:900;font-variant-numeric:tabular-nums;}
+/* 오늘 요약 패널 — 카드 하단이 비지 않게 채운다 */
+#splitcard{display:flex;flex-direction:column;}
+.stable{border-top:1px solid var(--line);}
+.srow{display:grid;grid-template-columns:106px 1fr auto;align-items:center;gap:10px;
+  padding:11px 2px;border-bottom:1px solid var(--line);}
+.srow .sl{font-size:12.5px;color:var(--mut);font-weight:600;}
+.srow .sv{font-size:14px;font-variant-numeric:tabular-nums;}
+.srow .sv b{font-weight:800;font-size:15.5px;}
+.srow .ss{text-align:right;}
+.sd{font-size:11.5px;font-weight:700;white-space:nowrap;}
+.sd.up{color:var(--green);} .sd.dn{color:var(--red);} .sd.fl{color:var(--mut);}
+.sbox{margin-top:14px;background:linear-gradient(110deg,#fdf6f5,#fff);border:1px solid #f0dcdc;
+  border-radius:12px;padding:13px 15px;}
+.sbox .sbt{font-size:11px;font-weight:800;color:var(--red);letter-spacing:.2px;
+  display:flex;justify-content:space-between;align-items:center;}
+.sbox .sbp{background:var(--red);color:#fff;border-radius:6px;padding:2px 7px;font-size:10.5px;}
+.sbox .sbb{margin-top:7px;font-size:13px;color:#333;}
+.sbox .sbb b{font-weight:800;}
+.sbox .sbq{margin-top:5px;font-size:21px;font-weight:900;color:var(--ink);
+  font-variant-numeric:tabular-nums;letter-spacing:-.4px;display:flex;align-items:baseline;gap:6px;}
+.sbox .sbq span{font-size:12px;font-weight:700;color:var(--mut);}
+.sbox .sbq .sbs{margin-left:auto;font-size:11.5px;font-weight:600;}
+.schips{margin-top:auto;padding-top:14px;display:flex;align-items:center;gap:7px;flex-wrap:wrap;}
+.schips .scl{font-size:11px;color:var(--mut);font-weight:700;margin-right:2px;}
+.schip{font-size:12px;background:#f3f3f6;border-radius:7px;padding:5px 10px;color:#444;}
+.schip b{font-weight:800;color:var(--ink);margin-left:3px;}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:22px;}
 @media(max-width:900px){.grid{grid-template-columns:1fr;}}
 .card{background:#fff;border-radius:16px;padding:20px 22px;box-shadow:0 1px 2px rgba(0,0,0,.04),0 6px 22px rgba(0,0,0,.05);}
@@ -974,8 +1000,8 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     <div class="kpis" id="inv-kpis"></div>
     <div class="hl" id="inv-hl" style="display:none"></div>
     <div class="grid">
-      <div class="card"><h2>재고 노후화 (Datecode 연도별)</h2>
-        <p class="desc"><span id="inv-oldlabel">—</span>년 이전 = 장기재고 (빨강) · 연도별 편차가 커서 <b>로그 스케일</b> — 막대 길이를 그대로 비교하지 마세요</p>
+      <div class="card"><h2 id="cAge-title">재고 노후화 (Datecode 연도별)</h2>
+        <p class="desc" id="cAge-desc">—</p>
         <div class="cbox"><canvas id="cAge"></canvas></div></div>
       <div class="card"><h2 id="cFam-title">FAMILY별 재고</h2>
         <p class="desc" id="cFam-desc">수량 기준 상위</p>
@@ -1246,15 +1272,7 @@ function showDay(idx){
       <div class="txt"><b>${esc(h.customer)}</b> 에 <b>${esc(h.part)}</b> <span class="q">${fmt(h.qty)}</span> EA 출고 · 담당 ${esc(h.sales)}</div>`;
   } else hlEl.style.display='none';
 
-  const net=k.net, netcol=net>=0?GREEN:RED;
-  document.getElementById('summary').innerHTML=`
-    <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:13px;line-height:1.9">
-      <div>📦 <b>입고</b> ${fmt(k.in_cnt)}건 · ${fmt(k.in_qty)} EA</div>
-      <div>🚚 <b>출고</b> ${fmt(k.out_cnt)}건 · ${fmt(k.out_qty)} EA</div>
-      <div>⚖️ <b>순물동</b> <span style="color:${netcol};font-weight:800">${net>=0?'+':''}${fmt(net)} EA</span></div>
-      <div>🏢 <b>출고 거래처</b> ${fmt(k.customers)}곳</div>
-    </div>`;
-
+  buildSummary(day, prev, tag);
   drawDayCharts(day); buildTables(day); showTab(TBcur);
 }
 
@@ -1285,6 +1303,51 @@ function drawDayCharts(day){
     options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
       plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.raw+'건'}}},
       scales:{x:{grid:{color:'#f0f0f3'},ticks:{precision:0}},y:{grid:{display:false}}}}});
+}
+
+// ── 오늘 요약 (카드를 채우는 요약 패널) ──
+function sRow(label, value, sub){
+  return `<div class="srow"><div class="sl">${label}</div>
+    <div class="sv">${value}</div><div class="ss">${sub||''}</div></div>`;
+}
+function pctOf(a,b){ return b?Math.round(a/b*100):0; }
+
+function buildSummary(day, prev, tag){
+  const k=day.kpi, pk=prev?prev.kpi:null;
+  const net=k.net;
+  const d=(v,y)=>{
+    if(y==null||y===undefined) return '';
+    const diff=v-y;
+    if(!y && !v) return '<span class="sd fl">변동 없음</span>';
+    if(!y) return '<span class="sd up">신규</span>';
+    const p=Math.round(Math.abs(diff)/Math.abs(y)*100);
+    const cls=diff>0?'up':(diff<0?'dn':'fl');
+    const ar=diff>0?'▲':(diff<0?'▼':'·');
+    return `<span class="sd ${cls}">${ar} ${fmt(Math.abs(diff))} (${diff>0?'+':''}${diff<0?'-':''}${p}%)</span>`;
+  };
+
+  const h=day.highlight;
+  const share=h&&k.out_qty?pctOf(h.qty,k.out_qty):0;
+  const top=(day.cust||[])[0];
+  const sales=(day.sales||[]).slice(0,3);
+
+  document.getElementById('summary').innerHTML=`
+    <div class="stable">
+      ${sRow('📦 입고', `${fmt(k.in_cnt)}건 · <b>${fmt(k.in_qty)}</b> EA`, d(k.in_qty, pk?pk.in_qty:null))}
+      ${sRow('🚚 출고', `${fmt(k.out_cnt)}건 · <b>${fmt(k.out_qty)}</b> EA`, d(k.out_qty, pk?pk.out_qty:null))}
+      ${sRow('⚖️ 순물동', `<span style="color:${net>=0?GREEN:RED};font-weight:800">${net>=0?'+':''}${fmt(net)}</span> EA`,
+             net>=0?'<span class="sd up">순입고</span>':'<span class="sd dn">순출고</span>')}
+      ${sRow('🏢 출고 거래처', `<b>${fmt(k.customers)}</b>곳`,
+             top?`<span class="sd fl">1위 ${esc(top.name)} ${pctOf(top.qty,k.out_qty)}%</span>`:'')}
+    </div>
+    ${h?`<div class="sbox">
+      <div class="sbt">${tag} 최대 출고 <span class="sbp">전체의 ${share}%</span></div>
+      <div class="sbb"><b>${esc(h.customer)}</b> · ${esc(h.part)}</div>
+      <div class="sbq">${fmt(h.qty)} <span>EA</span> <span class="sbs">담당 ${esc(h.sales)||'—'}</span></div>
+    </div>`:''}
+    ${sales.length?`<div class="schips"><span class="scl">담당 처리 건수</span>
+      ${sales.map(s=>`<span class="schip">${esc(s.name)||'—'} <b>${s.cnt}</b></span>`).join('')}
+    </div>`:''}`;
 }
 
 function emptyMsg(){return '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">이 날짜의 내역이 없습니다</div>';}
@@ -1328,44 +1391,87 @@ function renderInventory(){
       return `<button class="${all}${on}" onclick="selectInv('${n.replace(/'/g,"\\'")}')">${esc(n)}</button>`;
     }).join('');
 
-  document.getElementById('inv-oldlabel').textContent=I.old_year;
   document.getElementById('inv-foot').textContent=
     `자료: 재고 엑셀의 '${I.sheet}' 시트 · 재고 수량이 있는 품목만 집계 (합계 행 제외) · 장기재고 = Datecode ${I.old_year}년 이전`;
 
+  const hasDC=I.datecode.some(d=>d.qty>0);
   document.getElementById('inv-kpis').innerHTML=[
-    ['it','재고 품목',I.n_items,'건'],
-    ['in','총 재고',I.total_qty,'EA'],
-    ['av','가용 재고',I.avail_qty,'EA'],
-    ['bk','예약(booking)',I.booking_qty,'EA'],
-    ['old',`장기재고 (${I.old_year}년 이전)`,I.old_qty,'EA'],
-    ['cu','당월 출고',I.month.outbound,'EA'],
+    ['it','재고 품목',fmt(I.n_items),'건'],
+    ['in','총 재고',fmt(I.total_qty),'EA'],
+    ['av','가용 재고',fmt(I.avail_qty),'EA'],
+    ['bk','예약(booking)',fmt(I.booking_qty),'EA'],
+    // Datecode 가 없는 실에서 '장기재고 0'은 '장기재고가 없다'로 오해된다 → 정보없음으로 표시
+    ['old',`장기재고 (${I.old_year}년 이전)`, hasDC?fmt(I.old_qty):'정보없음', hasDC?'EA':''],
+    ['cu','당월 출고',fmt(I.month.outbound),'EA'],
   ].map(([c,l,v,u])=>`<div class="kpi ${c}"><div class="l">${l}</div>
-     <div class="v tab">${fmt(v)}<span class="u">${u}</span></div></div>`).join('');
+     <div class="v tab"${v==='정보없음'?' style="font-size:17px;color:#aaa"':''}>${v}<span class="u">${u}</span></div></div>`).join('');
 
   const hl=document.getElementById('inv-hl');
-  if(I.old_qty>0){
+  if(hasDC && I.old_qty>0){
     hl.style.display='flex';
     hl.innerHTML=`<span class="tag">장기재고</span><div class="txt">
       Datecode <b>${I.old_year}년 이전</b> 재고가 <span class="q">${fmt(I.old_qty)} EA</span>
       — 전체 재고의 <b>${pct(I.old_qty,I.total_qty)}%</b></div>`;
+  }else if(!hasDC){
+    hl.style.display='flex';
+    hl.innerHTML=`<span class="tag" style="background:#8a8a92">정보없음</span><div class="txt">
+      이 영업실 재고 시트에는 <b>Datecode 열이 비어 있어</b> 노후화를 계산할 수 없습니다.
+      장기재고 판단이 필요하면 원본 엑셀에 Datecode를 채워 주세요.</div>`;
   }else hl.style.display='none';
 
   Object.values(ICH).forEach(c=>c&&c.destroy()); ICH={};
 
   // 재고 노후화 — 장기재고는 빨강
-  // 2026년 재고가 2019년의 50배라 선형 축에서는 장기재고 막대가 안 보인다 → 로그 스케일
+  // Datecode 는 영업1,2실에만 채워져 있다(실측). 없는 실은 담당별 재고로 대체한다.
   const dc=I.datecode.filter(d=>d.qty>0);
-  ICH.age=new Chart(document.getElementById('cAge'),{type:'bar',
-    data:{labels:dc.map(d=>d.year),datasets:[{data:dc.map(d=>d.qty),
-      backgroundColor:dc.map(d=>d.year<=I.old_year?RED:BLUE),borderRadius:6,maxBarThickness:52}]},
-    options:{responsive:true,maintainAspectRatio:false,
-      plugins:{legend:{display:false},tooltip:{callbacks:{
-        label:c=>fmt(c.raw)+' EA ('+dc[c.dataIndex].items+'품목) · 전체의 '
-                 +pct(c.raw,I.total_qty)+'%'}}},
-      scales:{y:{type:'logarithmic',grid:{color:'#f0f0f3'},
-                 ticks:{callback:v=>{const s=String(v);
-                   return /^[125]0*$/.test(s)?fmt(v):'';}}},
-              x:{grid:{display:false}}}}});
+  const logY={type:'logarithmic',grid:{color:'#f0f0f3'},
+              ticks:{callback:v=>{const s=String(v);
+                return /^[125]0*$/.test(s)?fmt(v):'';}}};
+  const T=document.getElementById('cAge-title'), DSC=document.getElementById('cAge-desc');
+
+  if(dc.length){
+    T.textContent='재고 노후화 (Datecode 연도별)';
+    DSC.innerHTML=`<b>${I.old_year}년 이전 = 장기재고</b> (빨강) · 편차가 커서 <b>로그 스케일</b> — 막대 길이를 그대로 비교하지 마세요`;
+    ICH.age=new Chart(document.getElementById('cAge'),{type:'bar',
+      data:{labels:dc.map(d=>d.year),datasets:[{data:dc.map(d=>d.qty),
+        backgroundColor:dc.map(d=>d.year<=I.old_year?RED:BLUE),borderRadius:6,maxBarThickness:52}]},
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:false},tooltip:{callbacks:{
+          label:c=>fmt(c.raw)+' EA ('+dc[c.dataIndex].items+'품목) · 전체의 '
+                   +pct(c.raw,I.total_qty)+'%'}}},
+        scales:{y:logY,x:{grid:{display:false}}}}});
+  }else{
+    // 담당(SALES)별 재고 → 그것도 없으면 재고 상위 품목
+    const bs={};
+    I.items.forEach(x=>{ const s=(x.sales||'').trim();
+      if(s && s!=='.') bs[s]=(bs[s]||0)+x.qty; });
+    const sal=Object.entries(bs).sort((a,b)=>b[1]-a[1]).slice(0,8);
+
+    if(sal.length){
+      T.textContent='담당자별 재고';
+      DSC.innerHTML='이 영업실은 <b>Datecode 정보가 없어</b> 노후화를 계산할 수 없습니다 — 담당자별 재고로 대체';
+      ICH.age=new Chart(document.getElementById('cAge'),{type:'bar',
+        data:{labels:sal.map(s=>s[0]),datasets:[{data:sal.map(s=>s[1]),
+          backgroundColor:BLUE,borderRadius:5,maxBarThickness:22}]},
+        options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+          plugins:{legend:{display:false},tooltip:{callbacks:{
+            label:c=>fmt(c.raw)+' EA · 전체의 '+pct(c.raw,I.total_qty)+'%'}}},
+          scales:{x:{grid:{color:'#f0f0f3'},ticks:{callback:v=>fmt(v)}},
+                  y:{grid:{display:false}}}}});
+    }else{
+      const top=[...I.items].sort((a,b)=>b.qty-a.qty).slice(0,8);
+      T.textContent='재고 상위 품목';
+      DSC.innerHTML='이 영업실은 <b>Datecode·담당 정보가 없어</b> 노후화를 계산할 수 없습니다 — 재고 상위 품목으로 대체';
+      ICH.age=new Chart(document.getElementById('cAge'),{type:'bar',
+        data:{labels:top.map(x=>x.part),datasets:[{data:top.map(x=>x.qty),
+          backgroundColor:BLUE,borderRadius:5,maxBarThickness:22}]},
+        options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+          plugins:{legend:{display:false},tooltip:{callbacks:{
+            label:c=>fmt(c.raw)+' EA · 전체의 '+pct(c.raw,I.total_qty)+'%'}}},
+          scales:{x:{grid:{color:'#f0f0f3'},ticks:{callback:v=>fmt(v)}},
+                  y:{grid:{display:false},ticks:{font:{size:10}}}}}});
+    }
+  }
 
   // FAMILY 는 영업1,2실만 채워져 있다. 비어 있으면 VENDER 로 자동 전환한다.
   const named=a=>a.filter(x=>x.name && x.name!=='(미지정)' && x.name!=='.');
@@ -1432,8 +1538,11 @@ function renderInventory(){
   }else{ grid.style.display='none'; }
 
   document.getElementById('in-all').textContent=I.items.length;
-  document.getElementById('in-old').textContent=I.items.filter(x=>x.old>0).length;
+  document.getElementById('in-old').textContent=hasDC?I.items.filter(x=>x.old>0).length:'—';
+  document.getElementById('ib-old').disabled=!hasDC;
+  document.getElementById('ib-old').title=hasDC?'':'Datecode 정보가 없어 장기재고를 계산할 수 없습니다';
   document.getElementById('in-bk').textContent=I.items.filter(x=>x.booking>0).length;
+  if(!hasDC && ITAB==='old') ITAB='all';
   document.getElementById('invq').oninput=()=>drawInvTable();
   showInvTab('all');
 }
