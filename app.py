@@ -26,7 +26,10 @@ import openpyxl                                   # Excel 내보내기에만 쓴
 import fastxl                                     # 읽기 — openpyxl 보다 11배 빠름
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PW = os.environ.get("XLSX_PW", "")  # 비밀번호는 코드에 두지 않음 (업로드 화면 입력 또는 환경변수)
+# 엑셀 비밀번호는 서버가 들고 있어서 업로드할 때 칠 필요가 없다.
+# 코드에는 두지 않는다 — Render Environment 의 XLSX_PW 에 넣는다 (로컬은 같은 이름의 환경변수).
+# 페이지로도 내려보내지 않는다. 공개 URL이라 브라우저에 실으면 그대로 샌다.
+DEFAULT_PW = os.environ.get("XLSX_PW", "")
 CHART_JS = os.path.join(HERE, "chart.umd.min.js")
 DATA_FILE = os.path.join(os.environ.get("DATA_DIR", HERE), "saved_data.json")  # 데이터 저장(공유)
 
@@ -850,8 +853,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
-        if path == "/mailcfg":                           # 서버에 보내는 메일계정(SMTP) 설정됐나
-            self._send(200, json.dumps({"configured": bool(resolve_smtp(None))}))
+        if path == "/mailcfg":                           # 서버 설정 상태 (메일계정 / 엑셀 비밀번호)
+            # 비밀번호 자체는 절대 안 내려보낸다. 있는지 없는지만.
+            self._send(200, json.dumps({"configured": bool(resolve_smtp(None)),
+                                        "pw": bool(DEFAULT_PW)}))
         elif path == "/data":                            # 저장된 데이터(있으면)
             if os.path.exists(DATA_FILE):
                 with open(DATA_FILE, encoding="utf-8") as f:
@@ -928,6 +933,8 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:'Pretendard',-ap
 #drop .h{font-size:12px;color:#aaa;margin-top:6px;}
 .pwrow{margin-top:18px;display:flex;gap:8px;justify-content:center;align-items:center;color:#ccc;font-size:12.5px;}
 .pwrow input{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:#fff;border-radius:8px;padding:7px 11px;width:120px;font-family:inherit;}
+.pwtoggle{margin-top:16px;color:#8b8b96;font-size:12px;cursor:pointer;text-decoration:underline;text-underline-offset:3px;}
+.pwtoggle:hover{color:#ccc;}
 .loading{color:#fff;margin-top:22px;font-size:14px;display:none;}
 .spin{display:inline-block;width:16px;height:16px;border:2.5px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .8s linear infinite;vertical-align:-3px;margin-right:7px;}
 @keyframes sp{to{transform:rotate(360deg);}}
@@ -1042,10 +1049,15 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     <div id="drop">
       <div class="ic">📥</div>
       <div class="t">엑셀 파일들을 여기로 끌어다 놓거나 클릭 (여러 개 가능)</div>
-      <div class="h">.xlsx · 비밀번호 보호 지원 · 파일명의 (영업N실)로 실 구분</div>
+      <div class="h" id="pwhint">.xlsx · 비밀번호는 서버에 저장돼 있어 입력하지 않아도 됩니다 · 파일명의 (영업N실)로 실 구분</div>
       <input id="file" type="file" accept=".xlsx" multiple style="display:none">
     </div>
-    <div class="pwrow"><span>🔒 비밀번호</span><input id="pw" type="text" placeholder="엑셀 비밀번호"></div>
+    <!-- 비밀번호는 서버(DEFAULT_PW)에 있다. 다른 비밀번호를 쓰는 파일일 때만 펼쳐서 입력한다. -->
+    <div class="pwrow" id="pwrow" style="display:none">
+      <span>🔒 비밀번호</span><input id="pw" type="text" placeholder="다른 비밀번호를 쓸 때만"></div>
+    <div class="pwtoggle" id="pwtoggle"
+         onclick="document.getElementById('pwrow').style.display='flex';this.style.display='none';document.getElementById('pw').focus()">
+      비밀번호가 다른 파일인가요?</div>
     <div class="loading" id="loading"><span class="spin"></span>분석 중…</div>
     <div class="errmsg" id="errmsg"></div>
   </div>
@@ -1162,8 +1174,17 @@ const DEFAULT_EMAILS='seanlee@unitrontech.com';
 function emailsFor(name){
   return parseEmails(OFFICE_EMAILS[officeSlug(name)]||DEFAULT_EMAILS);
 }
-// 서버에 보내는 메일계정(SMTP)이 설정돼 있으면 업로드 직후 자동 발송된다
-fetch('/mailcfg').then(r=>r.json()).then(d=>{ SERVER_MAIL=!!d.configured; }).catch(()=>{});
+// 서버에 보내는 메일계정(SMTP)이 설정돼 있으면 업로드 직후 자동 발송된다.
+// 서버에 엑셀 비밀번호(XLSX_PW)가 없으면 비밀번호 칸을 펼쳐 둔다 — 안 그러면 업로드가 그냥 실패한다.
+fetch('/mailcfg').then(r=>r.json()).then(d=>{
+  SERVER_MAIL=!!d.configured;
+  if(!d.pw){
+    document.getElementById('pwrow').style.display='flex';
+    document.getElementById('pwtoggle').style.display='none';
+    document.getElementById('pwhint').textContent=
+      '.xlsx · 비밀번호 보호 지원 · 파일명의 (영업N실)로 실 구분';
+  }
+}).catch(()=>{});
 
 // 업로드 (여러 파일)
 const drop=document.getElementById('drop'),file=document.getElementById('file');
