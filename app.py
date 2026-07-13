@@ -1164,13 +1164,14 @@ const URLSLUG=location.pathname.replace(/\//g,'');
 // ── 고정 수신자 ──────────────────────────────────────────────
 // 키는 실 이름에서 뽑은 숫자 (예: '영업4실'/'Inv4' → '4', '영업1,2실' → '12').
 // 여기 없는 실은 DEFAULT_EMAILS 로 간다.
-// 스팸함 통과 여부를 먼저 확인하는 중 — 당분간 본인에게만 보낸다.
-// 확인되면 아래로 되돌린다:
-//   const TEAM_EMAILS=['frankie@unitrontech.com','mh.choi@unitrontech.com',
-//                      'yj.park@unitrontech.com','seanlee@unitrontech.com'].join(', ');
-//   const OFFICE_EMAILS={'4':TEAM_EMAILS, '5':TEAM_EMAILS};
-const OFFICE_EMAILS={};
+// 스팸함 통과 여부를 확인하는 중이라 영업실 담당자들에게는 아직 안 보낸다.
+// 확인되면 4·5실 수신자에 아래를 더한다:
+//   'frankie@unitrontech.com','mh.choi@unitrontech.com','yj.park@unitrontech.com'
 const DEFAULT_EMAILS='seanlee@unitrontech.com';
+const OFFICE_EMAILS={                         // 4·5실 자료는 자재관리팀(안성우 책임)에게도 간다
+  '4': DEFAULT_EMAILS+', sw.ahn@unitrontech.com',
+  '5': DEFAULT_EMAILS+', sw.ahn@unitrontech.com',
+};
 function emailsFor(name){
   return parseEmails(OFFICE_EMAILS[officeSlug(name)]||DEFAULT_EMAILS);
 }
