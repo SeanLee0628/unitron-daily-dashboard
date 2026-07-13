@@ -593,7 +593,7 @@ def _e(s):
 # 메일 하단 문의처. 답장(Reply-To)은 첫 번째 사람에게 간다.
 CONTACTS = [
     ("자재관리팀", "안성우 책임", "sw.ahn@unitrontech.com"),
-    ("기술지원", "이희서 매니저", "seanlee@unitrontech.com"),
+    ("기술지원 경영기획팀", "이희서 매니저", "seanlee@unitrontech.com"),
 ]
 CONTACT_NAME = f"유니트론텍 {CONTACTS[0][1]}"
 CONTACT_MAIL = CONTACTS[0][2]
