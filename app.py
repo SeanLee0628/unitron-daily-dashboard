@@ -17,7 +17,7 @@ import re
 import socket
 import threading
 import webbrowser
-from collections import defaultdict
+from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import msoffcrypto
@@ -48,10 +48,55 @@ def to_num(x):
         return 0.0
 
 
+# ---------------------------------------------------------------- 이름 정규화
+# 같은 사람/같은 회사가 다른 표기로 들어와 집계가 쪼개진다.
+#   담당: '박현진' / '박현진 책임매니저'  → 같은 사람
+#   거래처: 'Mobis' / 'MOBIS'            → 같은 회사 (대소문자만 다름)
+TITLES = ("책임매니저", "선임매니저", "수석매니저", "매니저", "책임연구원", "선임연구원",
+          "연구원", "책임", "선임", "수석", "프로", "사원", "주임", "대리", "과장",
+          "차장", "부장", "팀장", "실장", "이사", "상무", "전무", "대표", "님")
+_TITLE_RE = re.compile(r"\s*(" + "|".join(TITLES) + r")\s*$")
+
+
 def norm_sales(s):
+    """담당자 이름 → 직급 제거. '박현진 책임매니저' → '박현진'."""
     if not s:
         return "(미지정)"
-    return s.split("/")[0].strip() or "(미지정)"
+    n = str(s).split("/")[0].strip()
+    prev = None
+    while n and n != prev:                 # '책임매니저' 처럼 겹친 직급도 벗겨낸다
+        prev = n
+        n = _TITLE_RE.sub("", n).strip()
+    return n or "(미지정)"
+
+
+def company_key(s):
+    """비교용 키 — 대소문자·공백 무시. 거래처와 담당자 모두 같은 규칙."""
+    return re.sub(r"\s+", "", str(s or "")).upper()
+
+
+class Companies:
+    """같은 회사의 여러 표기를 하나로 모은다 (Mobis / MOBIS).
+
+    표시 이름은 가장 많이 쓰인 표기를 쓴다 — 임의로 대문자화하지 않는다.
+    담당자에는 쓰지 않는다 (영어 이름 James/JAMES 는 그대로 둔다).
+    """
+
+    def __init__(self):
+        self.seen = defaultdict(Counter)   # 키 -> Counter(원본 표기)
+
+    def add(self, name):
+        n = clean(name)
+        if n:
+            self.seen[company_key(n)][n] += 1
+        return n
+
+    def canon(self, name):
+        n = clean(name)
+        if not n:
+            return n
+        c = self.seen.get(company_key(n))
+        return c.most_common(1)[0][0] if c else n
 
 
 # ---------------------------------------------------------------- 파싱
@@ -367,8 +412,7 @@ def build_payload(files, password):
       '~ inventory' 시트 있음      → 재고 현황 파일
     재고도 실별로 보관한다. (전에는 하나만 남아 마지막 파일이 앞의 것을 덮어썼다)
     """
-    offices, inventories = [], {}
-    allbydate = defaultdict(lambda: ([], []))
+    raw_offices, inventories = [], {}     # [(실이름, {날짜:(inb,outb)})]
     for f in files:
         b64 = f["file"]
         if "," in b64[:64]:
@@ -378,9 +422,7 @@ def build_payload(files, password):
         try:
             per = parse_workbook(wb)
             if per:                                     # 입출고 파일
-                offices.append(office_block(name, per))
-                for d, (inb, outb) in per.items():
-                    allbydate[d][0].extend(inb); allbydate[d][1].extend(outb)
+                raw_offices.append((name, per))
                 continue
             ws = inventory_sheet(wb)                    # 재고 파일
             if ws is not None:
@@ -390,9 +432,41 @@ def build_payload(files, password):
         finally:
             wb.close()
 
-    if not offices and not inventories:
+    if not raw_offices and not inventories:
         raise ValueError("날짜 시트(YYYY-MM-DD)가 있는 입출고 파일이나 "
                          "'inventory' 시트가 있는 재고 파일을 찾지 못했습니다.")
+
+    # ---- 거래처 표기 통일 (Mobis / MOBIS → 가장 많이 쓰인 표기 하나로) ----
+    # 파일 전체를 본 뒤에야 대표 표기를 고를 수 있어 여기서 일괄 처리한다.
+    C = Companies()
+    for _, per in raw_offices:
+        for inb, outb in per.values():
+            for r in inb + outb:
+                C.add(r.get("customer"))
+    for inv in inventories.values():
+        for it in inv["items"]:
+            C.add(it.get("customer"))
+
+    for _, per in raw_offices:
+        for inb, outb in per.values():
+            for r in inb + outb:
+                r["customer"] = C.canon(r.get("customer"))
+    for inv in inventories.values():
+        bk = defaultdict(float)
+        for it in inv["items"]:
+            it["customer"] = C.canon(it.get("customer"))
+            it["sales"] = norm_sales(it.get("sales")) if it.get("sales") else ""
+            if it["customer"] and it["customer"] != "." and it["booking"]:
+                bk[it["customer"]] += it["booking"]
+        inv["customers"] = [dict(name=n, booking=v) for n, v in
+                            sorted(bk.items(), key=lambda x: -x[1])[:12]]
+
+    offices = []
+    allbydate = defaultdict(lambda: ([], []))
+    for name, per in raw_offices:
+        offices.append(office_block(name, per))
+        for d, (inb, outb) in per.items():
+            allbydate[d][0].extend(inb); allbydate[d][1].extend(outb)
 
     if len(offices) > 1:                                # 전체 합계 탭 (맨 앞)
         agg = {d: (allbydate[d][0], allbydate[d][1]) for d in allbydate}
