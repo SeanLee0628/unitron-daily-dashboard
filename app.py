@@ -811,8 +811,18 @@ const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','
 const RED="#c43a3a",BLUE="#3a6ea5",GREEN="#3f9d6b",AMBER="#e0a93a",INK="#23232b";
 if(window.Chart){Chart.defaults.font.family="'Pretendard',system-ui,sans-serif";Chart.defaults.color="#6b6b74";Chart.defaults.font.size=12;}
 let DATA=null, O=null, OFFI=0, SERVER_MAIL=false;
-// 고정 수신자 — 처음 열었을 때 기본으로 채워진다 (화면에서 수정 가능, 실별로 저장됨)
+
+// ── 고정 수신자 ──────────────────────────────────────────────
+// 실 이름에 숫자가 들어가면 여기서 잡는다 (예: '영업4실', '영업1,2실').
+// 여기 없는 실은 DEFAULT_EMAILS 로 간다.
+const OFFICE_EMAILS={
+  '4': 'sean94kr@gmail.com',            // 영업4실
+  '5': 'seanlee@unitrontech.com',       // 영업5실
+};
 const DEFAULT_EMAILS='seanlee@unitrontech.com';
+function emailsFor(name){
+  return parseEmails(OFFICE_EMAILS[officeSlug(name)]||DEFAULT_EMAILS);
+}
 // 서버에 보내는 메일계정(SMTP)이 설정돼 있으면, 사용자는 아무 설정 없이 발송 가능
 fetch('/mailcfg').then(r=>r.json()).then(d=>{ SERVER_MAIL=!!d.configured;
   const b=document.getElementById('btn-smtp');
@@ -843,7 +853,7 @@ function go(files){
     .then(r=>r.json()).then(res=>{
       document.getElementById('loading').style.display='none';
       if(res.error){ const e=document.getElementById('errmsg'); e.textContent='오류: '+res.error; e.style.display='block'; return; }
-      DATA=res; renderApp();
+      DATA=res; renderApp(); autoSend();
     }).catch(e=>{document.getElementById('loading').style.display='none';
       const el=document.getElementById('errmsg'); el.textContent='전송 오류: '+e; el.style.display='block';});
   }).catch(e=>{document.getElementById('loading').style.display='none';
@@ -921,7 +931,8 @@ function buildEmailCard(){
   document.getElementById('smsstatus').textContent='';
   document.getElementById('off-name2').textContent=O.name;
   document.getElementById('officelink2').textContent=officeLink();
-  document.getElementById('emailbox').value = localStorage.getItem('emails_'+O.name)||DEFAULT_EMAILS;
+  document.getElementById('emailbox').value =
+    localStorage.getItem('emails_'+O.name)||emailsFor(O.name).join(', ');
   document.getElementById('emailstatus').textContent='';
 }
 document.getElementById('btn-copy').onclick=()=>{
@@ -981,6 +992,34 @@ function sendOfficeEmail(office, emails){
     body:JSON.stringify({office:office.name, date:day.date, link:officeLinkFor(office.name),
       emails, day, smtp:getSmtp()})}).then(r=>r.json());
 }
+// ── 업로드 완료 시 자동 발송 (전송 버튼을 누르지 않아도 나간다) ──
+// 실별로 각자의 링크가 담긴 메일이 나간다. '전체 합계'는 실이 아니므로 제외.
+async function autoSend(){
+  const st=document.getElementById('emailstatus');
+  const targets=(DATA.offices||[])
+    .filter(o=>o.name!=='전체 합계')
+    .map(o=>({o, emails:emailsFor(o.name)}))
+    .filter(t=>t.emails.length);
+  if(!targets.length) return;
+
+  if(!SERVER_MAIL && !getSmtp().host){
+    if(st) st.textContent='⚠️ 자동 발송 안 됨 — 서버에 메일 계정(SMTP)이 설정돼 있지 않습니다.';
+    return;
+  }
+  if(st) st.textContent=`업로드 완료 — 자동 발송 중… (${targets.length}개 실)`;
+
+  const ok=[], fail=[];
+  for(const t of targets){
+    try{
+      const r=await sendOfficeEmail(t.o, t.emails);
+      (r && r.ok && r.sent ? ok : fail).push(t.o.name+(r&&r.error?(' ('+r.error+')'):''));
+    }catch(e){ fail.push(t.o.name+' ('+e+')'); }
+  }
+  if(st) st.textContent=
+    (ok.length?`✅ 자동 발송 완료: ${ok.join(', ')}`:'')+
+    (fail.length?`${ok.length?' · ':''}❌ 실패: ${fail.join(', ')}`:'');
+}
+
 document.getElementById('btn-email').onclick=()=>{
   const st=document.getElementById('emailstatus');
   if(!SERVER_MAIL && !getSmtp().host){ st.textContent='⚠️ 메일 발송 계정이 없습니다. (배포 시엔 서버에 설정되어 자동, 로컬 테스트는 ⚙️ 메일 설정)'; return; }
