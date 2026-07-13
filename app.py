@@ -695,32 +695,10 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     </div>
     <div class="tablewrap"><div class="scroll" id="tablearea"></div></div>
 
-    <div class="card" id="smscard" style="margin-top:22px">
-      <h2>📱 대시보드 링크 문자 발송 <span style="font-size:12px;color:var(--mut);font-weight:500">— 각 직원에게 자동으로 링크 전송</span></h2>
-      <p class="desc">받는 사람 휴대폰 번호를 넣고 발송하면, <b>지금 보고 있는 실의 링크</b>가 문자로 각 사람에게 자동 전송됩니다. (실마다 링크·번호가 따로 — 줄바꿈·콤마·세미콜론 구분 · 저장됨)</p>
-      <div style="font-size:12.5px;color:#555;margin:0 0 12px;word-break:break-all;background:#f6f6f8;border-radius:9px;padding:9px 13px">
-        🔗 <b id="off-name"></b> 링크: <span id="officelink" style="color:var(--blue);font-weight:600"></span>
-        <button id="btn-copy" style="margin-left:6px;font-size:11.5px;border:1px solid var(--line);background:#fff;border-radius:7px;padding:3px 9px;cursor:pointer;font-family:inherit">복사</button>
-      </div>
-      <textarea id="phonebox" rows="3" placeholder="010-1234-5678, 010-2222-3333, ..." style="width:100%;font-size:14px;padding:12px 14px;border:1.5px solid var(--line);border-radius:11px;font-family:inherit;outline:none;resize:vertical"></textarea>
-      <div style="margin-top:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-        <button id="btn-sms" class="confirmbtn">📱 링크 문자 발송</button>
-        <span id="smsstatus" style="font-size:12.5px;color:var(--mut)"></span>
-      </div>
-    </div>
-
-    <div class="card" id="emailcard" style="margin-top:22px">
-      <h2>📧 대시보드 링크 이메일 발송 <span style="font-size:12px;color:var(--mut);font-weight:500">— 각 실 담당자에게 그 실 링크 전송</span>
-        <button id="btn-smtp" style="float:right;font-size:12px;border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;font-family:inherit;font-weight:600">⚙️ 메일 설정</button></h2>
-      <p class="desc">받는 담당자 이메일을 넣고 발송하면 <b>지금 보고 있는 실의 링크</b>가 이메일로 전송됩니다. (실마다 따로 저장) · <b>전체 실 일괄 발송</b>은 모든 실에 각자 링크를 한 번에 보냅니다. · 보내는 계정은 <b>서버에 미리 설정</b>돼 있어 별도 설정 없이 발송됩니다. (⚙️는 로컬 테스트용)</p>
-      <div style="font-size:12.5px;color:#555;margin:0 0 12px;word-break:break-all;background:#f6f6f8;border-radius:9px;padding:9px 13px">
-        🔗 <b id="off-name2"></b> 링크: <span id="officelink2" style="color:var(--blue);font-weight:600"></span></div>
-      <textarea id="emailbox" rows="3" placeholder="seanlee@unitrontech.com" style="width:100%;font-size:14px;padding:12px 14px;border:1.5px solid var(--line);border-radius:11px;font-family:inherit;outline:none;resize:vertical"></textarea>
-      <div style="margin-top:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-        <button id="btn-email" class="confirmbtn">📧 이 실 링크 이메일 발송</button>
-        <button id="btn-email-all" class="confirmbtn" style="background:var(--ink)">📮 전체 실 일괄 발송</button>
-        <span id="emailstatus" style="font-size:12.5px;color:var(--mut)"></span>
-      </div>
+    <!-- 자동 발송 결과만 표시. 수동 발송(문자/이메일) UI는 없앴다. -->
+    <div class="hl" id="mailnotice" style="display:none;margin-top:22px">
+      <span class="tag">자동 발송</span>
+      <div class="txt" id="emailstatus"></div>
     </div>
 
     <div class="foot" id="foot"></div>
@@ -760,26 +738,6 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
   </div>
 </div>
 
-<div id="smtpmodal" style="display:none;position:fixed;inset:0;background:rgba(20,20,26,.55);z-index:200;align-items:center;justify-content:center;padding:20px">
-  <div style="background:#fff;border-radius:16px;max-width:440px;width:100%;padding:24px 26px;box-shadow:0 20px 60px rgba(0,0,0,.4)">
-    <h2 style="margin:0 0 4px;font-size:17px;font-weight:800">⚙️ 메일 발송 설정 (SMTP)</h2>
-    <p style="font-size:12px;color:var(--mut);margin:0 0 16px;line-height:1.6">이메일 보내는 계정을 1회 등록합니다. (이 브라우저에만 저장) · Gmail: <b>smtp.gmail.com</b>/587 + <b>앱 비밀번호</b> · Office365: <b>smtp.office365.com</b>/587</p>
-    <div style="display:flex;flex-direction:column;gap:10px">
-      <label style="font-size:12px;color:#555;font-weight:600">SMTP 호스트<input id="s-host" type="text" placeholder="smtp.gmail.com" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
-      <div style="display:flex;gap:10px">
-        <label style="font-size:12px;color:#555;font-weight:600;width:90px">포트<input id="s-port" type="text" value="587" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
-        <label style="font-size:12px;color:#555;font-weight:600;flex:1">보내는 주소(From)<input id="s-from" type="text" placeholder="비우면 계정과 동일" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
-      </div>
-      <label style="font-size:12px;color:#555;font-weight:600">계정(아이디)<input id="s-user" type="text" placeholder="you@company.com" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
-      <label style="font-size:12px;color:#555;font-weight:600">비밀번호(앱 비밀번호)<input id="s-pass" type="password" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
-    </div>
-    <div style="margin-top:18px;display:flex;gap:10px;justify-content:flex-end">
-      <button id="smtp-cancel" style="background:#eee;border:none;font-family:inherit;font-size:13px;font-weight:700;padding:10px 18px;border-radius:9px;cursor:pointer;color:#555">닫기</button>
-      <button id="smtp-save" class="confirmbtn" style="padding:10px 20px">저장</button>
-    </div>
-  </div>
-</div>
-
 <script>
 const fmt=n=>(n==null?'—':Number(n).toLocaleString('ko-KR'));
 const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -788,21 +746,24 @@ if(window.Chart){Chart.defaults.font.family="'Pretendard',system-ui,sans-serif";
 let DATA=null, O=null, OFFI=0, SERVER_MAIL=false;
 
 // ── 고정 수신자 ──────────────────────────────────────────────
-// 실 이름에 숫자가 들어가면 여기서 잡는다 (예: '영업4실', '영업1,2실').
+// 키는 실 이름에서 뽑은 숫자 (예: '영업4실'/'Inv4' → '4', '영업1,2실' → '12').
 // 여기 없는 실은 DEFAULT_EMAILS 로 간다.
+const TEAM_EMAILS=[
+  'frankie@unitrontech.com',
+  'mh.choi@unitrontech.com',
+  'yj.park@unitrontech.com',
+  'seanlee@unitrontech.com',
+].join(', ');
 const OFFICE_EMAILS={
-  '4': 'sean94kr@gmail.com',            // 영업4실
-  '5': 'seanlee@unitrontech.com',       // 영업5실
+  '4': TEAM_EMAILS,      // 영업4실
+  '5': TEAM_EMAILS,      // 영업5실
 };
 const DEFAULT_EMAILS='seanlee@unitrontech.com';
 function emailsFor(name){
   return parseEmails(OFFICE_EMAILS[officeSlug(name)]||DEFAULT_EMAILS);
 }
-// 서버에 보내는 메일계정(SMTP)이 설정돼 있으면, 사용자는 아무 설정 없이 발송 가능
-fetch('/mailcfg').then(r=>r.json()).then(d=>{ SERVER_MAIL=!!d.configured;
-  const b=document.getElementById('btn-smtp');
-  if(SERVER_MAIL && b){ b.textContent='✅ 메일 발송 준비됨'; b.title='서버에 발송 계정이 설정돼 있습니다'; }
-}).catch(()=>{});
+// 서버에 보내는 메일계정(SMTP)이 설정돼 있으면 업로드 직후 자동 발송된다
+fetch('/mailcfg').then(r=>r.json()).then(d=>{ SERVER_MAIL=!!d.configured; }).catch(()=>{});
 
 // 업로드 (여러 파일)
 const drop=document.getElementById('drop'),file=document.getElementById('file');
@@ -894,69 +855,13 @@ function renderOffice(){
   }).join('');
   drawCompare();
   showDay(O.today_idx);
-  buildEmailCard();
 }
 
 function officeSlug(name){ const d=(String(name).match(/\d/g)||[]).join(''); return d||'all'; }
 function officeLink(){ return location.origin+'/'+officeSlug(O.name); }
-function buildEmailCard(){
-  document.getElementById('off-name').textContent=O.name;
-  document.getElementById('officelink').textContent=officeLink();
-  document.getElementById('phonebox').value = localStorage.getItem('phones_'+O.name)||'';
-  document.getElementById('smsstatus').textContent='';
-  document.getElementById('off-name2').textContent=O.name;
-  document.getElementById('officelink2').textContent=officeLink();
-  document.getElementById('emailbox').value =
-    localStorage.getItem('emails_'+O.name)||emailsFor(O.name).join(', ');
-  document.getElementById('emailstatus').textContent='';
-}
-document.getElementById('btn-copy').onclick=()=>{
-  navigator.clipboard.writeText(officeLink()).then(()=>{
-    document.getElementById('smsstatus').textContent='✅ 링크 복사됨 — 카톡 등에 붙여넣기 가능';
-  });
-};
-document.getElementById('btn-sms').onclick=()=>{
-  const st=document.getElementById('smsstatus');
-  const raw=document.getElementById('phonebox').value.trim();
-  localStorage.setItem('phones_'+O.name, raw);
-  const numbers=[...new Set(raw.split(/[;,\s]+/).map(s=>s.trim()).filter(Boolean))];
-  if(!numbers.length){ st.textContent='⚠️ 받는 휴대폰 번호를 입력하세요.'; return; }
-  const day=O.days[CUR];
-  const text=`[입출고 대시보드] ${O.name} (${day.date})\n${officeLink()}`;
-  st.textContent=`문자 발송 중… (${numbers.length}명)`;
-  fetch('/sms',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({numbers, text})})
-  .then(r=>r.json()).then(res=>{
-    st.textContent = res.error ? ('오류: '+res.error)
-      : `✅ ${O.name} 링크를 ${numbers.length}명에게 문자 발송했습니다.`;
-  }).catch(e=>{ st.textContent='전송 오류: '+e; });
-};
 
-// ── SMTP 설정 (이 브라우저에 저장) ──
+// 로컬 테스트용 SMTP 설정(브라우저 저장). 배포본은 서버 환경변수를 쓰므로 보통 비어 있다.
 function getSmtp(){ try{return JSON.parse(localStorage.getItem('smtp_config')||'{}');}catch(e){return {};} }
-const smtpModal=document.getElementById('smtpmodal');
-document.getElementById('btn-smtp').onclick=()=>{
-  const c=getSmtp();
-  document.getElementById('s-host').value=c.host||'';
-  document.getElementById('s-port').value=c.port||'587';
-  document.getElementById('s-from').value=c.from||'';
-  document.getElementById('s-user').value=c.user||'';
-  document.getElementById('s-pass').value=c.pass||'';
-  smtpModal.style.display='flex';
-};
-document.getElementById('smtp-cancel').onclick=()=>smtpModal.style.display='none';
-smtpModal.onclick=e=>{ if(e.target===smtpModal) smtpModal.style.display='none'; };
-document.getElementById('smtp-save').onclick=()=>{
-  const c={host:document.getElementById('s-host').value.trim(),
-    port:document.getElementById('s-port').value.trim()||'587',
-    from:document.getElementById('s-from').value.trim(),
-    user:document.getElementById('s-user').value.trim(),
-    pass:document.getElementById('s-pass').value};
-  if(!c.host){ alert('SMTP 호스트를 입력하세요.'); return; }
-  localStorage.setItem('smtp_config', JSON.stringify(c));
-  smtpModal.style.display='none';
-  document.getElementById('emailstatus').textContent='✅ 메일 설정 저장됨 — 이제 발송할 수 있어요.';
-};
 
 // ── 링크 이메일 발송 ──
 function officeLinkFor(name){ return location.origin+'/'+officeSlug(name); }
@@ -969,8 +874,15 @@ function sendOfficeEmail(office, emails){
 }
 // ── 업로드 완료 시 자동 발송 (전송 버튼을 누르지 않아도 나간다) ──
 // 실별로 각자의 링크가 담긴 메일이 나간다. '전체 합계'는 실이 아니므로 제외.
-async function autoSend(){
+function notice(msg){
+  const box=document.getElementById('mailnotice');
   const st=document.getElementById('emailstatus');
+  if(!box||!st) return;
+  st.innerHTML=msg;
+  box.style.display='flex';
+}
+
+async function autoSend(){
   const targets=(DATA.offices||[])
     .filter(o=>o.name!=='전체 합계')
     .map(o=>({o, emails:emailsFor(o.name)}))
@@ -978,10 +890,10 @@ async function autoSend(){
   if(!targets.length) return;
 
   if(!SERVER_MAIL && !getSmtp().host){
-    if(st) st.textContent='⚠️ 자동 발송 안 됨 — 서버에 메일 계정(SMTP)이 설정돼 있지 않습니다.';
+    notice('⚠️ 자동 발송 안 됨 — 서버에 메일 계정(SMTP)이 설정돼 있지 않습니다.');
     return;
   }
-  if(st) st.textContent=`업로드 완료 — 자동 발송 중… (${targets.length}개 실)`;
+  notice(`업로드 완료 — 자동 발송 중… (${targets.length}개 실)`);
 
   const ok=[], fail=[];
   for(const t of targets){
@@ -990,37 +902,10 @@ async function autoSend(){
       (r && r.ok && r.sent ? ok : fail).push(t.o.name+(r&&r.error?(' ('+r.error+')'):''));
     }catch(e){ fail.push(t.o.name+' ('+e+')'); }
   }
-  if(st) st.textContent=
-    (ok.length?`✅ 자동 발송 완료: ${ok.join(', ')}`:'')+
-    (fail.length?`${ok.length?' · ':''}❌ 실패: ${fail.join(', ')}`:'');
+  notice(
+    (ok.length?`✅ 자동 발송 완료 — <b>${ok.join(', ')}</b>`:'')+
+    (fail.length?`${ok.length?' · ':''}❌ 실패: ${fail.join(', ')}`:''));
 }
-
-document.getElementById('btn-email').onclick=()=>{
-  const st=document.getElementById('emailstatus');
-  if(!SERVER_MAIL && !getSmtp().host){ st.textContent='⚠️ 메일 발송 계정이 없습니다. (배포 시엔 서버에 설정되어 자동, 로컬 테스트는 ⚙️ 메일 설정)'; return; }
-  const raw=document.getElementById('emailbox').value.trim();
-  localStorage.setItem('emails_'+O.name, raw);
-  const emails=parseEmails(raw);
-  if(!emails.length){ st.textContent='⚠️ 받는 이메일을 입력하세요.'; return; }
-  st.textContent=`발송 중… (${emails.length}명)`;
-  sendOfficeEmail(O, emails).then(res=>{
-    st.textContent = res.error ? ('오류: '+res.error) : `✅ ${O.name} 링크를 ${emails.length}명에게 이메일 발송했습니다.`;
-  }).catch(e=>{ st.textContent='전송 오류: '+e; });
-};
-document.getElementById('btn-email-all').onclick=async()=>{
-  const st=document.getElementById('emailstatus');
-  if(!SERVER_MAIL && !getSmtp().host){ st.textContent='⚠️ 메일 발송 계정이 없습니다. (배포 시엔 서버에 설정되어 자동)'; return; }
-  localStorage.setItem('emails_'+O.name, document.getElementById('emailbox').value.trim());
-  const targets=DATA.offices.map(o=>({o, emails:parseEmails(localStorage.getItem('emails_'+o.name)||'')})).filter(t=>t.emails.length);
-  if(!targets.length){ st.textContent='⚠️ 저장된 실별 이메일이 없습니다. 각 실(/12 /3 /4 /5)에서 이메일을 입력·저장하세요.'; return; }
-  st.textContent=`전체 발송 중… (${targets.length}개 실)`;
-  let ok=0; const fail=[];
-  for(const t of targets){
-    try{ const res=await sendOfficeEmail(t.o, t.emails); if(res.error) fail.push(t.o.name+': '+res.error); else ok++; }
-    catch(e){ fail.push(t.o.name+': '+e); }
-  }
-  st.textContent=`✅ ${ok}개 실 발송 완료`+(fail.length?` · ⚠️ 실패 ${fail.length}건: `+fail.join(' / '):'');
-};
 
 function showUpload(){
   document.getElementById('dash').style.display='none';
