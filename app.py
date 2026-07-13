@@ -412,6 +412,19 @@ def merge_inventories(invs):
     )
 
 
+def decode_upload(b64):
+    """브라우저 FileReader.readAsDataURL 결과에서 엑셀 바이트를 뽑는다.
+
+    접두사 길이는 브라우저가 붙이는 MIME에 따라 달라진다.
+      data:application/octet-stream;base64,...                        → 37자
+      data:application/vnd.openxmlformats-...spreadsheetml.sheet;...  → 78자
+    base64 알파벳에 콤마는 없으므로, 첫 콤마 앞은 전부 접두사다.
+    """
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[1]
+    return base64.b64decode(b64)
+
+
 def build_payload(files, password):
     """files: [{name, file(base64)}] → {offices:[...], inventories:{실: {...}}}
 
@@ -422,11 +435,8 @@ def build_payload(files, password):
     """
     raw_offices, inventories = [], {}     # [(실이름, {날짜:(inb,outb)})]
     for f in files:
-        b64 = f["file"]
-        if "," in b64[:64]:
-            b64 = b64.split(",", 1)[1]
         name = f.get("name") or "실"
-        wb = open_wb(base64.b64decode(b64), password)
+        wb = open_wb(decode_upload(f["file"]), password)
         try:
             per = parse_workbook(wb)
             if per:                                     # 입출고 파일
