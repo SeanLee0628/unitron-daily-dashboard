@@ -350,21 +350,94 @@ CONTACT_MAIL = "sw.ahn@unitrontech.com"
 FROM_NAME = os.environ.get("MAIL_FROM_NAME", "유니트론텍 입출고 대시보드")
 
 
-def compose_email_html(office, date, day=None, link=""):
-    """메일 본문 — 대시보드 링크와 문의처만. (요약·내역표는 대시보드에서 본다)"""
-    btn = (f'<a href="{_e(link)}" style="display:inline-block;background:#c43a3a;color:#fff;'
-           f'text-decoration:none;font-weight:800;font-size:15px;padding:14px 28px;'
-           f'border-radius:10px">입출고 및 재고현황 조회 →</a>'
-           f'<div style="font-size:12px;color:#999;margin-top:12px;word-break:break-all">{_e(link)}</div>'
-           ) if link else '<div style="color:#999">링크 없음</div>'
+# 이메일은 웹이 아니다 — Outlook 은 flex/grid/외부CSS 를 못 읽는다.
+# 테이블 레이아웃 + 인라인 스타일로만 짠다. (하우스 스타일: 차콜 + 시그니처 레드)
+INK = "#1d1d20"
+RED = "#c43a3a"
+MUT = "#8a8a92"
+LINE = "#e4e4e9"
+FONT = "'Malgun Gothic','맑은 고딕',-apple-system,'Segoe UI',Roboto,sans-serif"
 
-    return f"""<div style="font-family:'Malgun Gothic',sans-serif;color:#222;max-width:560px">
-  {btn}
-  <div style="margin-top:30px;padding-top:14px;border-top:1px solid #e6e6ea;font-size:13px;color:#555">
-    문의: <b>{_e(CONTACT_NAME)}</b>
-    (<a href="mailto:{_e(CONTACT_MAIL)}" style="color:#3a6ea5;text-decoration:none">{_e(CONTACT_MAIL)}</a>)
-  </div>
-</div>"""
+
+def compose_email_text(office, date, link=""):
+    """텍스트 버전 — HTML 을 못 읽는 클라이언트용. 스팸 점수도 낮춰준다."""
+    return (
+        f"UNITRONTECH\n"
+        f"입출고 및 재고현황\n"
+        f"{office} · {date}\n\n"
+        f"아래 링크에서 조회하실 수 있습니다.\n"
+        f"{link}\n\n"
+        f"----------------------------------------\n"
+        f"문의: {CONTACT_NAME} ({CONTACT_MAIL})\n"
+        f"본 메일은 자동 발송되었습니다.\n"
+    )
+
+
+def compose_email_html(office, date, day=None, link=""):
+    cta = (
+        # 버튼은 <table> 로 감싸야 Outlook 에서 모양이 유지된다
+        f'<table role="presentation" cellpadding="0" cellspacing="0" border="0">'
+        f'<tr><td align="center" bgcolor="{RED}" style="border-radius:6px">'
+        f'<a href="{_e(link)}" style="display:inline-block;padding:15px 34px;'
+        f'font-family:{FONT};font-size:14.5px;font-weight:700;color:#ffffff;'
+        f'text-decoration:none;letter-spacing:-0.2px">입출고 및 재고현황 조회</a>'
+        f'</td></tr></table>'
+    ) if link else ""
+
+    raw = (f'<div style="margin-top:14px;font-size:11.5px;color:{MUT};'
+           f'word-break:break-all;line-height:1.6">{_e(link)}</div>') if link else ""
+
+    return f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#f2f2f5">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+       style="background:#f2f2f5;padding:32px 16px">
+  <tr><td align="center">
+    <table role="presentation" width="540" cellpadding="0" cellspacing="0" border="0"
+           style="width:540px;max-width:100%;background:#ffffff;border:1px solid {LINE};border-radius:10px">
+
+      <!-- 상단 시그니처 라인 -->
+      <tr><td style="height:3px;background:{RED};font-size:0;line-height:0;
+                     border-radius:10px 10px 0 0">&nbsp;</td></tr>
+
+      <!-- 헤더 -->
+      <tr><td style="padding:30px 36px 0 36px;font-family:{FONT}">
+        <div style="font-size:10.5px;font-weight:700;color:{MUT};letter-spacing:1.6px">UNITRONTECH</div>
+        <div style="margin-top:10px;font-size:20px;font-weight:700;color:{INK};letter-spacing:-0.5px">
+          입출고 및 재고현황</div>
+        <div style="margin-top:7px;font-size:13px;color:{MUT}">
+          {_e(office)} <span style="color:{LINE}">|</span> {_e(date)}</div>
+      </td></tr>
+
+      <!-- 구분선 -->
+      <tr><td style="padding:22px 36px 0 36px">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr><td style="height:1px;background:{LINE};font-size:0;line-height:0">&nbsp;</td></tr>
+        </table>
+      </td></tr>
+
+      <!-- 본문 + CTA -->
+      <tr><td style="padding:24px 36px 32px 36px;font-family:{FONT}">
+        <div style="font-size:13.5px;color:#4a4a52;line-height:1.75;margin-bottom:22px">
+          해당 일자의 입출고 내역과 재고현황을 아래에서 조회하실 수 있습니다.</div>
+        {cta}
+        {raw}
+      </td></tr>
+
+      <!-- 푸터 -->
+      <tr><td style="padding:18px 36px 24px 36px;background:#fafafb;
+                     border-top:1px solid {LINE};border-radius:0 0 10px 10px;font-family:{FONT}">
+        <div style="font-size:12.5px;color:#55555d;line-height:1.7">
+          문의 &nbsp;<span style="color:{INK};font-weight:700">{_e(CONTACT_NAME)}</span>
+          &nbsp;<a href="mailto:{_e(CONTACT_MAIL)}"
+             style="color:{RED};text-decoration:none">{_e(CONTACT_MAIL)}</a>
+        </div>
+        <div style="margin-top:8px;font-size:11px;color:{MUT}">본 메일은 자동 발송되었습니다.</div>
+      </td></tr>
+
+    </table>
+  </td></tr>
+</table>
+</body></html>"""
 
 
 def resolve_smtp(cfg):
@@ -383,14 +456,23 @@ def resolve_smtp(cfg):
     )
 
 
-def _send_smtp(emails, subject, body, cfg):
-    """SMTP 발송. cfg = {host, port, user, pw, sender}."""
+def _send_smtp(emails, subject, body, cfg, text=None):
+    """SMTP 발송. cfg = {host, port, user, pw, sender}. text = 대체 텍스트 본문."""
     import smtplib, ssl
+    from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
+    from email.utils import formataddr
     host, port = cfg["host"], cfg["port"]
     user, pw, sender = cfg["user"], cfg["pw"], cfg["sender"]
-    from email.utils import formataddr
-    msg = MIMEText(body, "html", "utf-8")
+
+    # HTML 전용 메일은 스팸 점수가 올라간다 → 텍스트 버전을 같이 보낸다
+    if text:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(text, "plain", "utf-8"))
+        msg.attach(MIMEText(body, "html", "utf-8"))
+    else:
+        msg = MIMEText(body, "html", "utf-8")
+
     msg["Subject"] = subject
     # 메일주소 대신 이름으로 보이게 (한글은 RFC2047 로 자동 인코딩됨)
     msg["From"] = formataddr((FROM_NAME, sender)) if FROM_NAME else sender
@@ -471,11 +553,12 @@ def send_email(payload):
     link = payload.get("link", "")
     subject = f"[입출고 및 재고현황 {date}]"
     body = compose_email_html(office, date, day, link)
+    text = compose_email_text(office, date, link)
     cfg = resolve_smtp(payload.get("smtp"))
     if cfg:                                             # SMTP (요청 설정 또는 환경변수)
         if not emails:
             raise ValueError("받는 사람 이메일을 입력하세요.")
-        return _send_smtp(emails, subject, body, cfg)
+        return _send_smtp(emails, subject, body, cfg, text=text)
     return _send_outlook(emails, subject, body, payload.get("send"))  # 폴백: 로컬 Outlook
 
 
