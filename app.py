@@ -590,8 +590,13 @@ def _e(s):
     return (str(s) if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-CONTACT_NAME = "유니트론텍 안성우 책임"
-CONTACT_MAIL = "sw.ahn@unitrontech.com"
+# 메일 하단 문의처. 답장(Reply-To)은 첫 번째 사람에게 간다.
+CONTACTS = [
+    ("자재관리팀", "안성우 책임", "sw.ahn@unitrontech.com"),
+    ("기술지원", "이희서 매니저", "seanlee@unitrontech.com"),
+]
+CONTACT_NAME = f"유니트론텍 {CONTACTS[0][1]}"
+CONTACT_MAIL = CONTACTS[0][2]
 # 받는 사람 메일함에 보이는 발신자 이름. 없으면 메일주소가 그대로 노출된다.
 FROM_NAME = os.environ.get("MAIL_FROM_NAME", "유니트론텍 입출고 대시보드")
 
@@ -614,9 +619,26 @@ def compose_email_text(office, date, link=""):
         f"아래 링크에서 조회하실 수 있습니다.\n"
         f"{link}\n\n"
         f"----------------------------------------\n"
-        f"문의: {CONTACT_NAME} ({CONTACT_MAIL})\n"
-        f"본 메일은 자동 발송되었습니다.\n"
+        f"문의\n"
+        + "".join(f"  {team} {who} ({mail})\n" for team, who, mail in CONTACTS)
+        + f"\n본 메일은 자동 발송되었습니다.\n"
     )
+
+
+def compose_contacts_html():
+    """푸터 문의처 — 팀 / 이름 / 메일 한 줄씩."""
+    rows = []
+    for i, (team, who, mail) in enumerate(CONTACTS):
+        pad = "padding-top:6px;" if i else ""
+        rows.append(
+            f'<tr><td style="{pad}font-family:{FONT};font-size:12.5px;'
+            f'color:#55555d;line-height:1.7;white-space:nowrap">'
+            f'<span style="color:{MUT}">{_e(team)}</span>'
+            f'&nbsp;<span style="color:{INK};font-weight:700">{_e(who)}</span>'
+            f'&nbsp;<a href="mailto:{_e(mail)}" style="color:{RED};'
+            f'text-decoration:none">{_e(mail)}</a></td></tr>')
+    return ('<table role="presentation" cellpadding="0" cellspacing="0" border="0">'
+            + "".join(rows) + "</table>")
 
 
 def compose_email_html(office, date, day=None, link=""):
@@ -672,12 +694,10 @@ def compose_email_html(office, date, day=None, link=""):
       <!-- 푸터 -->
       <tr><td style="padding:18px 36px 24px 36px;background:#fafafb;
                      border-top:1px solid {LINE};border-radius:0 0 10px 10px;font-family:{FONT}">
-        <div style="font-size:12.5px;color:#55555d;line-height:1.7">
-          문의 &nbsp;<span style="color:{INK};font-weight:700">{_e(CONTACT_NAME)}</span>
-          &nbsp;<a href="mailto:{_e(CONTACT_MAIL)}"
-             style="color:{RED};text-decoration:none">{_e(CONTACT_MAIL)}</a>
-        </div>
-        <div style="margin-top:8px;font-size:11px;color:{MUT}">본 메일은 자동 발송되었습니다.</div>
+        <div style="font-size:10.5px;font-weight:700;color:{MUT};letter-spacing:1.2px;
+                    margin-bottom:9px">문의</div>
+        {compose_contacts_html()}
+        <div style="margin-top:12px;font-size:11px;color:{MUT}">본 메일은 자동 발송되었습니다.</div>
       </td></tr>
 
     </table>
@@ -1123,7 +1143,11 @@ const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','
 const RED="#c43a3a",BLUE="#3a6ea5",GREEN="#3f9d6b",AMBER="#e0a93a",INK="#23232b";
 if(window.Chart){Chart.defaults.font.family="'Pretendard',system-ui,sans-serif";Chart.defaults.color="#6b6b74";Chart.defaults.font.size=12;}
 let DATA=null, O=null, OFFI=0, SERVER_MAIL=false;
-let INVS={}, INVK=null, VIEW='io';      // 실별 재고 / 선택된 실 / 현재 뷰
+let INVS={}, INVK=null, INVNAMES=[], VIEW='io';   // 실별 재고 / 선택된 실 / 볼 수 있는 실 / 현재 뷰
+
+// 각 실 페이지(/12 /3 /4 /5)는 자기 실 것만 본다. 재고도 마찬가지.
+// selectOffice 가 주소를 바꾸므로 시작할 때 한 번 붙잡아 둔다.
+const URLSLUG=location.pathname.replace(/\//g,'');
 
 // ── 고정 수신자 ──────────────────────────────────────────────
 // 키는 실 이름에서 뽑은 숫자 (예: '영업4실'/'Inv4' → '4', '영업1,2실' → '12').
@@ -1196,24 +1220,28 @@ function renderApp(){
   document.getElementById('foot').textContent='자료: 사내 일일 입출고 엑셀 (날짜 시트) · 입고/출고 마스터 시트 미사용 · 파일명 (영업N실)로 실 구분';
 
   INVS=DATA.inventories||{};
-  const hasIO=DATA.offices && DATA.offices.length, hasInv=Object.keys(INVS).length>0;
+  // 실 페이지에서는 자기 실 재고만 남긴다 — 다른 실 재고는 목록에도 없다.
+  // 루트(/)에서만 실 선택 버튼이 나온다.
+  INVNAMES=Object.keys(INVS);
+  if(URLSLUG) INVNAMES=INVNAMES.filter(n=>officeSlug(n)===URLSLUG);
+
+  const hasIO=DATA.offices && DATA.offices.length, hasInv=INVNAMES.length>0;
   document.getElementById('viewnav').style.display=(hasIO||hasInv)?'block':'none';
   document.getElementById('vw-io').style.display=hasIO?'':'none';
   document.getElementById('vw-inv').style.display=hasInv?'':'none';
 
   if(hasIO){
-    const slug=location.pathname.replace(/\//g,'');
     let idx=0;
-    if(slug){ const i=DATA.offices.findIndex(o=>officeSlug(o.name)===slug); if(i>=0) idx=i; }
+    if(URLSLUG){ const i=DATA.offices.findIndex(o=>officeSlug(o.name)===URLSLUG); if(i>=0) idx=i; }
     selectOffice(idx);
   }
   if(hasInv){
-    // 재고는 실별로 보는 게 기본. '전체 합계'는 버튼으로 따로 볼 수 있게 둔다.
-    const names=Object.keys(INVS).filter(n=>n!=='전체 합계');
-    INVK=names[0]||'전체 합계';
+    // 재고는 실별로 보는 게 기본. '전체 합계'는 루트에서 버튼으로만 볼 수 있다.
+    const pref=INVNAMES.filter(n=>n!=='전체 합계');
+    INVK=pref[0]||INVNAMES[0];
     renderInventory();
   }
-  showView(hasIO?'io':'inv');
+  showView(hasIO?'io':(hasInv?'inv':'io'));
 }
 
 function showView(v){
@@ -1225,6 +1253,7 @@ function showView(v){
   document.getElementById('vw-inv').classList.toggle('on',!io);
   if(!io){
     const I=INVS[INVK];
+    if(!I) return;
     document.getElementById('h-date').innerHTML=`재고 현황 <span class="d">·</span> ${esc(INVK)}`;
     document.getElementById('h-meta').textContent=
       `품목 ${fmt(I.n_items)}건 · 총 재고 ${fmt(I.total_qty)} EA`;
@@ -1458,21 +1487,30 @@ function showTab(which){
 let ICH={}, ITAB='all';
 const pct=(a,b)=>b?Math.round(a/b*1000)/10:0;
 
-function selectInv(name){ INVK=name; renderInventory(); showView('inv'); }
+// 볼 수 있는 실만 연다 (실 페이지에서는 자기 실뿐 — 차트 드릴다운으로도 못 넘어간다)
+function selectInv(name){
+  if(!INVNAMES.includes(name)) return;
+  INVK=name; renderInventory(); showView('inv');
+}
 
 function renderInventory(){
   const I=INVS[INVK];
   if(!I) return;
 
-  // 실 선택 버튼 (전체 합계가 있으면 맨 앞)
-  const names=Object.keys(INVS).sort((a,b)=>
-    (a==='전체 합계'?-1:0)-(b==='전체 합계'?-1:0));
-  document.getElementById('inv-offseg').innerHTML=
-    '<span class="lab">영업실</span>'+names.map(n=>{
+  // 실 선택 버튼. 실 페이지에서는 볼 수 있는 실이 자기 실 하나뿐이라 버튼도 하나 (누를 수 없음).
+  const seg=document.getElementById('inv-offseg');
+  if(INVNAMES.length<2){
+    seg.innerHTML=`<span class="lab">영업실</span>`+
+      `<button class="on" style="cursor:default" disabled>${esc(INVK)}</button>`;
+  }else{
+    const names=INVNAMES.slice().sort((a,b)=>
+      (a==='전체 합계'?-1:0)-(b==='전체 합계'?-1:0));
+    seg.innerHTML='<span class="lab">영업실</span>'+names.map(n=>{
       const all=n==='전체 합계'?' all':'';
       const on=n===INVK?' on':'';
       return `<button class="${all}${on}" onclick="selectInv('${n.replace(/'/g,"\\'")}')">${esc(n)}</button>`;
     }).join('');
+  }
 
   document.getElementById('inv-foot').textContent=
     `자료: 재고 엑셀의 '${I.sheet}' 시트 · 재고 수량이 있는 품목만 집계 (합계 행 제외) · 장기재고 = Datecode ${I.old_year}년 이전`;
