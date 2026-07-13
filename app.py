@@ -357,8 +357,6 @@ def compose_email_html(office, date, day=None, link=""):
            ) if link else '<div style="color:#999">링크 없음</div>'
 
     return f"""<div style="font-family:'Malgun Gothic',sans-serif;color:#222;max-width:560px">
-  <div style="font-size:17px;font-weight:800;margin-bottom:2px">{_e(office)} · 일일 입출고</div>
-  <div style="color:#777;font-size:13px;margin-bottom:22px">{_e(date)}</div>
   {btn}
   <div style="margin-top:30px;padding-top:14px;border-top:1px solid #e6e6ea;font-size:13px;color:#555">
     문의: <b>{_e(CONTACT_NAME)}</b>
