@@ -344,55 +344,26 @@ def _e(s):
     return (str(s) if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def compose_email_html(office, date, day, link=""):
-    k = day.get("kpi", {})
-    def fmt(n):
-        try: return f"{round(float(n)):,}"
-        except: return str(n)
-    th = 'style="text-align:left;padding:7px 10px;border-bottom:2px solid #ddd;font-size:11px;color:#888;text-transform:uppercase"'
-    td = 'style="padding:7px 10px;border-bottom:1px solid #eee;font-size:12.5px"'
-    tdr = 'style="padding:7px 10px;border-bottom:1px solid #eee;font-size:12.5px;text-align:right;font-weight:700"'
+CONTACT_NAME = "유니트론텍 안성우 책임"
+CONTACT_MAIL = "sw.ahn@unitrontech.com"
 
-    out_rows = "".join(
-        f"<tr><td {td}>{i+1}</td><td {td}><b>{_e(r.get('customer') or '—')}</b></td>"
-        f"<td {td}>{_e(r.get('part'))}</td><td {tdr}>{fmt(r.get('qty'))}</td>"
-        f"<td {td}>{_e(r.get('sales'))}</td><td {td}>{_e(r.get('doc') or '—')}</td>"
-        f"<td {td} >{_e(r.get('remark') or '')}</td></tr>"
-        for i, r in enumerate(day.get("out_rows", [])))
-    in_rows = "".join(
-        f"<tr><td {td}>{i+1}</td><td {td}><b>{_e(r.get('customer') or '—')}</b></td>"
-        f"<td {td}>{_e(r.get('part'))}</td><td {tdr}>{fmt(r.get('qty'))}</td>"
-        f"<td {td}>{_e(r.get('sales'))}</td><td {td}>{_e(r.get('remark') or '')}</td></tr>"
-        for i, r in enumerate(day.get("in_rows", [])))
 
-    out_tbl = (f'<table style="width:100%;border-collapse:collapse;margin-top:6px">'
-               f'<tr><th {th}>#</th><th {th}>거래처</th><th {th}>PART#</th>'
-               f'<th {th} style="text-align:right">수량</th><th {th}>담당</th><th {th}>문서번호</th><th {th}>비고</th></tr>'
-               f'{out_rows}</table>') if day.get("out_rows") else '<p style="color:#999">출고 내역 없음</p>'
-    in_tbl = (f'<table style="width:100%;border-collapse:collapse;margin-top:6px">'
-              f'<tr><th {th}>#</th><th {th}>거래처/공급</th><th {th}>PART#</th>'
-              f'<th {th} style="text-align:right">수량</th><th {th}>담당</th><th {th}>비고</th></tr>'
-              f'{in_rows}</table>') if day.get("in_rows") else '<p style="color:#999">입고 내역 없음</p>'
+def compose_email_html(office, date, day=None, link=""):
+    """메일 본문 — 대시보드 링크와 문의처만. (요약·내역표는 대시보드에서 본다)"""
+    btn = (f'<a href="{_e(link)}" style="display:inline-block;background:#c43a3a;color:#fff;'
+           f'text-decoration:none;font-weight:800;font-size:15px;padding:14px 28px;'
+           f'border-radius:10px">대시보드 열기 →</a>'
+           f'<div style="font-size:12px;color:#999;margin-top:12px;word-break:break-all">{_e(link)}</div>'
+           ) if link else '<div style="color:#999">링크 없음</div>'
 
-    link_box = (f'<div style="background:#fbedec;border:1px solid #f0cfcf;border-radius:10px;padding:16px 18px;margin-bottom:18px">'
-                f'<div style="font-size:13px;color:#a93030;font-weight:700;margin-bottom:8px">🔗 {_e(office)} 실시간 대시보드</div>'
-                f'<a href="{_e(link)}" style="display:inline-block;background:#c43a3a;color:#fff;text-decoration:none;font-weight:800;font-size:14px;padding:11px 22px;border-radius:9px">대시보드 열기 →</a>'
-                f'<div style="font-size:12px;color:#888;margin-top:9px;word-break:break-all">{_e(link)}</div></div>') if link else ""
-    return f"""<div style="font-family:'Malgun Gothic',sans-serif;color:#222;max-width:880px">
-  <h2 style="margin:0 0 4px">{_e(office)} · 일일 입출고 리포트</h2>
-  <div style="color:#666;font-size:13px;margin-bottom:14px">{_e(date)}</div>
-  {link_box}
-  <div style="background:#f6f6f8;border-radius:8px;padding:12px 16px;font-size:13.5px;margin-bottom:18px">
-    📦 입고 <b>{fmt(k.get('in_cnt'))}</b>건 / {fmt(k.get('in_qty'))} EA &nbsp;·&nbsp;
-    🚚 출고 <b>{fmt(k.get('out_cnt'))}</b>건 / {fmt(k.get('out_qty'))} EA &nbsp;·&nbsp;
-    ⚖️ 순물동 <b>{fmt(k.get('net'))}</b> EA &nbsp;·&nbsp; 🏢 출고 거래처 {fmt(k.get('customers'))}곳
+    return f"""<div style="font-family:'Malgun Gothic',sans-serif;color:#222;max-width:560px">
+  <div style="font-size:17px;font-weight:800;margin-bottom:2px">{_e(office)} · 일일 입출고</div>
+  <div style="color:#777;font-size:13px;margin-bottom:22px">{_e(date)}</div>
+  {btn}
+  <div style="margin-top:30px;padding-top:14px;border-top:1px solid #e6e6ea;font-size:13px;color:#555">
+    문의: <b>{_e(CONTACT_NAME)}</b>
+    (<a href="mailto:{_e(CONTACT_MAIL)}" style="color:#3a6ea5;text-decoration:none">{_e(CONTACT_MAIL)}</a>)
   </div>
-  <h3 style="margin:18px 0 0">🚚 출고 내역 ({fmt(k.get('out_cnt'))}건)</h3>{out_tbl}
-  <h3 style="margin:22px 0 0">📦 입고 내역 ({fmt(k.get('in_cnt'))}건)</h3>{in_tbl}
-  <div style="margin-top:24px;padding-top:14px;border-top:1px solid #e6e6ea;font-size:12.5px;color:#555">
-    문의: <b>유니트론텍 안성우 책임</b>
-  </div>
-  <div style="color:#aaa;font-size:11px;margin-top:8px">자동 생성 · 사내 일일 입출고 엑셀 기준</div>
 </div>"""
 
 
@@ -422,6 +393,8 @@ def _send_smtp(emails, subject, body, cfg):
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = ", ".join(emails)
+    # 답장은 발송용 계정이 아니라 문의처로 가야 한다
+    msg["Reply-To"] = CONTACT_MAIL
     with smtplib.SMTP(host, port, timeout=25) as s:
         s.ehlo()
         try:
