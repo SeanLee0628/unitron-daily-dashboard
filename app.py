@@ -301,24 +301,84 @@ def office_block(name, per):
     return dict(name=name, dates=dates, today_idx=len(days) - 1, days=days)
 
 
+ALL = "전체 합계"
+
+
+def merge_inventories(invs):
+    """실별 재고 → 전체 합계 재고. 품목 리스트를 합치고 집계를 다시 계산한다."""
+    if not invs:
+        return None
+    items = [dict(it) for inv in invs for it in inv["items"]]
+    years = sorted({d["year"] for inv in invs for d in inv["datecode"]})
+    ndays = max((len(inv["month"]["daily_in"]) for inv in invs), default=31)
+
+    def agg(key):
+        acc = defaultdict(lambda: [0, 0.0])
+        for inv in invs:
+            for r in inv[key]:
+                acc[r["name"]][0] += r["items"]
+                acc[r["name"]][1] += r["qty"]
+        return [dict(name=n, items=v[0], qty=v[1])
+                for n, v in sorted(acc.items(), key=lambda x: -x[1][1])]
+
+    def dsum(key, i):
+        return sum(inv["month"][key][i] if i < len(inv["month"][key]) else 0.0
+                   for inv in invs)
+
+    cust = defaultdict(float)
+    for inv in invs:
+        for c in inv["customers"]:
+            cust[c["name"]] += c["booking"]
+
+    dc = []
+    for y in years:
+        n = q = 0
+        for inv in invs:
+            for d in inv["datecode"]:
+                if d["year"] == y:
+                    n += d["items"]; q += d["qty"]
+        dc.append(dict(year=y, items=n, qty=q))
+
+    s = lambda k: sum(inv[k] for inv in invs)
+    return dict(
+        sheet=", ".join(sorted({inv["sheet"] for inv in invs})),
+        n_items=len(items),
+        total_qty=s("total_qty"), avail_qty=s("avail_qty"),
+        booking_qty=s("booking_qty"), old_qty=s("old_qty"),
+        old_year=invs[0]["old_year"],
+        by_office=agg("by_office"), by_vender=agg("by_vender"), by_family=agg("by_family"),
+        datecode=dc,
+        month=dict(prev=sum(inv["month"]["prev"] for inv in invs),
+                   inbound=sum(inv["month"]["inbound"] for inv in invs),
+                   outbound=sum(inv["month"]["outbound"] for inv in invs),
+                   daily_in=[dsum("daily_in", i) for i in range(ndays)],
+                   daily_out=[dsum("daily_out", i) for i in range(ndays)]),
+        customers=[dict(name=n, booking=v)
+                   for n, v in sorted(cust.items(), key=lambda x: -x[1])[:12]],
+        items=items,
+    )
+
+
 def build_payload(files, password):
-    """files: [{name, file(base64)}] → {offices:[...], inventory:{...}}
+    """files: [{name, file(base64)}] → {offices:[...], inventories:{실: {...}}}
 
     파일 종류는 시트 이름으로 자동 판별한다.
       날짜 시트(YYYY-MM-DD) 있음  → 일일 입출고 파일
       '~ inventory' 시트 있음      → 재고 현황 파일
+    재고도 실별로 보관한다. (전에는 하나만 남아 마지막 파일이 앞의 것을 덮어썼다)
     """
-    offices, inventory = [], None
+    offices, inventories = [], {}
     allbydate = defaultdict(lambda: ([], []))
     for f in files:
         b64 = f["file"]
         if "," in b64[:64]:
             b64 = b64.split(",", 1)[1]
+        name = f.get("name") or "실"
         wb = open_wb(base64.b64decode(b64), password)
         try:
             per = parse_workbook(wb)
             if per:                                     # 입출고 파일
-                offices.append(office_block(f.get("name") or "실", per))
+                offices.append(office_block(name, per))
                 for d, (inb, outb) in per.items():
                     allbydate[d][0].extend(inb); allbydate[d][1].extend(outb)
                 continue
@@ -326,17 +386,121 @@ def build_payload(files, password):
             if ws is not None:
                 inv = parse_inventory(ws)
                 if inv:
-                    inventory = inv
+                    inventories[name] = inv
         finally:
             wb.close()
 
-    if not offices and not inventory:
+    if not offices and not inventories:
         raise ValueError("날짜 시트(YYYY-MM-DD)가 있는 입출고 파일이나 "
                          "'inventory' 시트가 있는 재고 파일을 찾지 못했습니다.")
-    if len(offices) > 1:                            # 전체 합계 탭 (맨 앞)
+
+    if len(offices) > 1:                                # 전체 합계 탭 (맨 앞)
         agg = {d: (allbydate[d][0], allbydate[d][1]) for d in allbydate}
-        offices.insert(0, office_block("전체 합계", agg))
-    return dict(offices=offices, inventory=inventory)
+        offices.insert(0, office_block(ALL, agg))
+    if len(inventories) > 1:
+        inventories[ALL] = merge_inventories(list(inventories.values()))
+
+    return dict(offices=offices, inventories=inventories)
+
+
+# ---------------------------------------------------------------- Excel 내보내기
+def export_xlsx(payload):
+    """지금 보고 있는 화면을 엑셀로. {office, view, day?/inventory?} → xlsx bytes."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    HDR = PatternFill("solid", fgColor="1D1D20")
+    HDRF = Font(color="FFFFFF", bold=True, size=10)
+    TITLE = Font(bold=True, size=14, color="1D1D20")
+    RED = Font(bold=True, color="C43A3A")
+    THIN = Side(style="thin", color="E4E4E9")
+    BOX = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+    def sheet(name, title, headers, rows, widths=None, red_col=None):
+        ws = wb.create_sheet(name[:31])
+        ws["A1"] = title
+        ws["A1"].font = TITLE
+        ws.append([])
+        ws.append(headers)
+        for c in ws[3]:
+            c.fill, c.font, c.border = HDR, HDRF, BOX
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        for r in rows:
+            ws.append(r)
+        for row in ws.iter_rows(min_row=4, max_row=ws.max_row):
+            for c in row:
+                c.border = BOX
+                if isinstance(c.value, (int, float)):
+                    c.number_format = "#,##0"
+                    c.alignment = Alignment(horizontal="right")
+        if red_col:
+            for row in ws.iter_rows(min_row=4, max_row=ws.max_row,
+                                    min_col=red_col, max_col=red_col):
+                for c in row:
+                    if isinstance(c.value, (int, float)) and c.value > 0:
+                        c.font = RED
+        for i, w in enumerate(widths or [], start=1):
+            ws.column_dimensions[ws.cell(row=3, column=i).column_letter].width = w
+        ws.freeze_panes = "A4"
+        return ws
+
+    office = payload.get("office") or "전체"
+    view = payload.get("view") or "io"
+
+    if view == "inv":
+        inv = payload["inventory"]
+        sheet("요약", f"재고 현황 · {office}",
+              ["항목", "값"],
+              [["재고 품목", inv["n_items"]], ["총 재고", inv["total_qty"]],
+               ["가용 재고", inv["avail_qty"]], ["예약(booking)", inv["booking_qty"]],
+               [f"장기재고 ({inv['old_year']}년 이전)", inv["old_qty"]],
+               ["당월 입고", inv["month"]["inbound"]],
+               ["당월 출고", inv["month"]["outbound"]]],
+              widths=[26, 16])
+        sheet("품목", f"품목별 재고 · {office}",
+              ["PART#", "MOBIS ID", "FAMILY", "VENDER", "실", "담당", "고객",
+               "재고", "가용", "예약", "장기재고", "Datecode"],
+              [[i["part"], i["mobis"], i["family"], i["vender"], i["office"],
+                i["sales"], i["customer"], i["qty"], i["avail"], i["booking"],
+                i["old"], i["oldest"] or ""] for i in
+               sorted(inv["items"], key=lambda x: -x["qty"])],
+              widths=[26, 16, 16, 12, 10, 10, 18, 12, 12, 12, 12, 11],
+              red_col=11)
+        sheet("노후화", f"재고 노후화 (Datecode) · {office}",
+              ["연도", "품목 수", "수량"],
+              [[d["year"], d["items"], d["qty"]] for d in inv["datecode"]],
+              widths=[10, 12, 16])
+        sheet("MOBIS별", f"MOBIS ID별 · {office}",
+              ["MOBIS ID", "품목 수", "수량"],
+              [[m["name"], m["items"], m["qty"]] for m in inv["by_family"]],
+              widths=[20, 12, 16])
+    else:
+        day = payload["day"]
+        k = day.get("kpi", {})
+        sheet("요약", f"일일 입출고 · {office} · {day.get('date','')}",
+              ["항목", "값"],
+              [["입고 건수", k.get("in_cnt")], ["입고 수량", k.get("in_qty")],
+               ["출고 건수", k.get("out_cnt")], ["출고 수량", k.get("out_qty")],
+               ["순물동(입-출)", k.get("net")], ["출고 거래처", k.get("customers")]],
+              widths=[20, 16])
+        sheet("출고", f"출고 내역 · {office} · {day.get('date','')}",
+              ["#", "거래처", "PART#", "수량", "담당", "문서번호", "비고"],
+              [[i + 1, r.get("customer"), r.get("part"), r.get("qty"),
+                r.get("sales"), r.get("doc"), r.get("remark")]
+               for i, r in enumerate(day.get("out_rows", []))],
+              widths=[6, 22, 26, 12, 10, 16, 22])
+        sheet("입고", f"입고 내역 · {office} · {day.get('date','')}",
+              ["#", "거래처/공급", "PART#", "수량", "담당", "FAB", "비고"],
+              [[i + 1, r.get("customer"), r.get("part"), r.get("qty"),
+                r.get("sales"), r.get("fab"), r.get("remark")]
+               for i, r in enumerate(day.get("in_rows", []))],
+              widths=[6, 22, 26, 12, 10, 10, 22])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------- 이메일 (Outlook)
@@ -607,6 +771,17 @@ class Handler(BaseHTTPRequestHandler):
                         json.dump(result, f, ensure_ascii=False)
                 except Exception:
                     pass
+            elif self.path == "/export":
+                data = export_xlsx(payload)
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "application/vnd.openxmlformats-officedocument."
+                                 "spreadsheetml.sheet")
+                self.send_header("Content-Disposition", 'attachment; filename="export.xlsx"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             elif self.path == "/send":
                 result = send_email(payload)
             elif self.path == "/sms":
@@ -685,6 +860,9 @@ header .reload{position:absolute;right:40px;top:30px;background:rgba(255,255,255
 .kpi.in{--c:var(--blue);} .kpi.out{--c:var(--red);} .kpi.net{--c:var(--green);} .kpi.cu{--c:var(--amber);}
 .kpi.old{--c:var(--red);} .kpi.av{--c:var(--green);} .kpi.bk{--c:var(--amber);} .kpi.it{--c:var(--blue);}
 /* 뷰 전환 (입출고 / 재고) */
+.xlsbtn{margin-bottom:4px;background:#1f7a4c;color:#fff;border:none;font-family:inherit;
+  font-size:13px;font-weight:700;padding:11px 18px;border-radius:10px;cursor:pointer;}
+.xlsbtn:hover{background:#186139;} .xlsbtn[disabled]{opacity:.5;cursor:default;}
 .viewseg{display:inline-flex;background:#e9e9ef;border-radius:12px;padding:4px;gap:4px;margin-bottom:4px;}
 .viewseg button{border:none;background:transparent;font-family:inherit;font-size:14px;font-weight:800;color:#777;padding:10px 22px;border-radius:9px;cursor:pointer;transition:.15s;}
 .viewseg button.on{background:#fff;color:var(--ink);box-shadow:0 2px 8px rgba(0,0,0,.12);}
@@ -753,9 +931,12 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     <div class="meta" id="h-meta"></div>
   </header>
   <div class="wrap" id="viewnav" style="display:none;padding-bottom:0">
-    <div class="viewseg">
-      <button class="on" id="vw-io" onclick="showView('io')">📦 일일 입출고</button>
-      <button id="vw-inv" onclick="showView('inv')">📊 재고 현황</button>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div class="viewseg">
+        <button class="on" id="vw-io" onclick="showView('io')">📦 일일 입출고</button>
+        <button id="vw-inv" onclick="showView('inv')">📊 재고 현황</button>
+      </div>
+      <button id="btn-xls" class="xlsbtn" onclick="exportXlsx()">⬇ Excel 내보내기</button>
     </div>
   </div>
 
@@ -789,13 +970,15 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
 
   <!-- ================= 재고 현황 ================= -->
   <div class="wrap" id="invview" style="display:none">
+    <div class="offseg" id="inv-offseg"></div>
     <div class="kpis" id="inv-kpis"></div>
     <div class="hl" id="inv-hl" style="display:none"></div>
     <div class="grid">
       <div class="card"><h2>재고 노후화 (Datecode 연도별)</h2>
         <p class="desc"><span id="inv-oldlabel">—</span>년 이전 = 장기재고 (빨강) · 연도별 편차가 커서 <b>로그 스케일</b> — 막대 길이를 그대로 비교하지 마세요</p>
         <div class="cbox"><canvas id="cAge"></canvas></div></div>
-      <div class="card"><h2>FAMILY별 재고</h2><p class="desc">수량 기준 상위</p>
+      <div class="card"><h2 id="cFam-title">FAMILY별 재고</h2>
+        <p class="desc" id="cFam-desc">수량 기준 상위</p>
         <div class="cbox"><canvas id="cFam"></canvas></div></div>
     </div>
     <div class="grid">
@@ -803,6 +986,11 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
         <div class="cbox"><canvas id="cMon"></canvas></div></div>
       <div class="card"><h2>고객사 예약(booking)</h2><p class="desc">예약 수량 상위</p>
         <div class="cbox"><canvas id="cBook"></canvas></div></div>
+    </div>
+    <div class="grid" id="offgrid" style="display:none">
+      <div class="card" style="grid-column:1/-1"><h2>영업실별 재고</h2>
+        <p class="desc">실별 재고 수량 비교 · 클릭하면 해당 실로 이동</p>
+        <div class="cbox"><canvas id="cOff"></canvas></div></div>
     </div>
 
     <div class="tabs">
@@ -827,6 +1015,7 @@ const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','
 const RED="#c43a3a",BLUE="#3a6ea5",GREEN="#3f9d6b",AMBER="#e0a93a",INK="#23232b";
 if(window.Chart){Chart.defaults.font.family="'Pretendard',system-ui,sans-serif";Chart.defaults.color="#6b6b74";Chart.defaults.font.size=12;}
 let DATA=null, O=null, OFFI=0, SERVER_MAIL=false;
+let INVS={}, INVK=null, VIEW='io';      // 실별 재고 / 선택된 실 / 현재 뷰
 
 // ── 고정 수신자 ──────────────────────────────────────────────
 // 키는 실 이름에서 뽑은 숫자 (예: '영업4실'/'Inv4' → '4', '영업1,2실' → '12').
@@ -852,7 +1041,15 @@ drop.onclick=()=>file.click();
 drop.addEventListener('drop',ev=>{if(ev.dataTransfer.files.length)go(ev.dataTransfer.files);});
 file.addEventListener('change',ev=>{if(ev.target.files.length)go(ev.target.files);});
 
-function officeName(fn){ const m=fn.match(/\(([^)]+)\)/); return m?m[1]:fn.replace(/\.xlsx$/i,''); }
+// 파일명 → 실 이름.  (영업N실) 이 있으면 그걸 쓰고,
+// 없으면 숫자를 뽑는다: Inv5/inv5_ → 영업5실, Inv12/inv12_ → 영업1,2실
+function officeName(fn){
+  const p=fn.match(/\(([^)]+)\)/);
+  if(p) return p[1];
+  const d=(fn.replace(/\.xlsx$/i,'').match(/\d+/)||[''])[0];
+  if(d==='12') return '영업1,2실';
+  return d?`영업${d}실`:fn.replace(/\.xlsx$/i,'');
+}
 function go(files){
   files=[...files].filter(f=>/\.xlsx$/i.test(f.name));
   if(!files.length) return;
@@ -890,9 +1087,11 @@ function renderApp(){
   document.getElementById('dash').style.display='block';
   document.getElementById('foot').textContent='자료: 사내 일일 입출고 엑셀 (날짜 시트) · 입고/출고 마스터 시트 미사용 · 파일명 (영업N실)로 실 구분';
 
-  const hasIO=DATA.offices && DATA.offices.length, hasInv=!!DATA.inventory;
-  // 두 종류가 다 올라왔을 때만 전환 버튼을 보여준다
-  document.getElementById('viewnav').style.display=(hasIO&&hasInv)?'block':'none';
+  INVS=DATA.inventories||{};
+  const hasIO=DATA.offices && DATA.offices.length, hasInv=Object.keys(INVS).length>0;
+  document.getElementById('viewnav').style.display=(hasIO||hasInv)?'block':'none';
+  document.getElementById('vw-io').style.display=hasIO?'':'none';
+  document.getElementById('vw-inv').style.display=hasInv?'':'none';
 
   if(hasIO){
     const slug=location.pathname.replace(/\//g,'');
@@ -900,21 +1099,50 @@ function renderApp(){
     if(slug){ const i=DATA.offices.findIndex(o=>officeSlug(o.name)===slug); if(i>=0) idx=i; }
     selectOffice(idx);
   }
-  if(hasInv) renderInventory();
+  if(hasInv){
+    const names=Object.keys(INVS);
+    INVK=names.includes('전체 합계')?'전체 합계':names[0];
+    renderInventory();
+  }
   showView(hasIO?'io':'inv');
 }
 
 function showView(v){
   const io=v==='io';
+  VIEW=io?'io':'inv';
   document.getElementById('ioview').style.display=io?'block':'none';
   document.getElementById('invview').style.display=io?'none':'block';
   document.getElementById('vw-io').classList.toggle('on',io);
   document.getElementById('vw-inv').classList.toggle('on',!io);
   if(!io){
-    const I=DATA.inventory;
-    document.getElementById('h-date').innerHTML=`재고 현황 <span class="d">·</span> ${esc(I.sheet)}`;
-    document.getElementById('h-meta').textContent=`품목 ${fmt(I.n_items)}건 · 총 재고 ${fmt(I.total_qty)} EA`;
+    const I=INVS[INVK];
+    document.getElementById('h-date').innerHTML=`재고 현황 <span class="d">·</span> ${esc(INVK)}`;
+    document.getElementById('h-meta').textContent=
+      `품목 ${fmt(I.n_items)}건 · 총 재고 ${fmt(I.total_qty)} EA`;
   }else if(O){ showDay(CUR); }
+}
+
+// ── Excel 내보내기 (지금 보고 있는 화면 그대로) ──
+function exportXlsx(){
+  const b=document.getElementById('btn-xls');
+  const body = VIEW==='inv'
+    ? {office:INVK, view:'inv', inventory:INVS[INVK]}
+    : {office:O.name, view:'io', day:O.days[CUR]};
+  const label = VIEW==='inv' ? `재고_${INVK}` : `입출고_${O.name}_${O.days[CUR].date}`;
+  b.disabled=true; b.textContent='⏳ 만드는 중…';
+  fetch('/export',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)})
+  .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.blob(); })
+  .then(bl=>{
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(bl);
+    a.download=label.replace(/[\\/:*?"<>|]/g,'_')+'.xlsx';
+    a.click(); URL.revokeObjectURL(a.href);
+    b.textContent='✅ 내려받음';
+    setTimeout(()=>{b.textContent='⬇ Excel 내보내기'; b.disabled=false;},1800);
+  })
+  .catch(e=>{ b.textContent='❌ 실패: '+e.message;
+    setTimeout(()=>{b.textContent='⬇ Excel 내보내기'; b.disabled=false;},2500); });
 }
 function buildOffseg(){
   // 각 실 페이지는 자기 실만 표시 — 다른 실로 가는 버튼 없음 (실 간 이동 불가)
@@ -1084,8 +1312,22 @@ function showTab(which){
 let ICH={}, ITAB='all';
 const pct=(a,b)=>b?Math.round(a/b*1000)/10:0;
 
+function selectInv(name){ INVK=name; renderInventory(); showView('inv'); }
+
 function renderInventory(){
-  const I=DATA.inventory;
+  const I=INVS[INVK];
+  if(!I) return;
+
+  // 실 선택 버튼 (전체 합계가 있으면 맨 앞)
+  const names=Object.keys(INVS).sort((a,b)=>
+    (a==='전체 합계'?-1:0)-(b==='전체 합계'?-1:0));
+  document.getElementById('inv-offseg').innerHTML=
+    '<span class="lab">영업실</span>'+names.map(n=>{
+      const all=n==='전체 합계'?' all':'';
+      const on=n===INVK?' on':'';
+      return `<button class="${all}${on}" onclick="selectInv('${n.replace(/'/g,"\\'")}')">${esc(n)}</button>`;
+    }).join('');
+
   document.getElementById('inv-oldlabel').textContent=I.old_year;
   document.getElementById('inv-foot').textContent=
     `자료: 재고 엑셀의 '${I.sheet}' 시트 · 재고 수량이 있는 품목만 집계 (합계 행 제외) · 장기재고 = Datecode ${I.old_year}년 이전`;
@@ -1125,9 +1367,20 @@ function renderInventory(){
                    return /^[125]0*$/.test(s)?fmt(v):'';}}},
               x:{grid:{display:false}}}}});
 
-  const fam=I.by_family.slice(0,8);
+  // FAMILY 는 영업1,2실만 채워져 있다. 비어 있으면 VENDER 로 자동 전환한다.
+  const named=a=>a.filter(x=>x.name && x.name!=='(미지정)' && x.name!=='.');
+  const useFam=named(I.by_family).length>0;
+  const dim=useFam?named(I.by_family):named(I.by_vender);
+  const dimName=useFam?'FAMILY':'VENDER';
+  const unk=(useFam?I.by_family:I.by_vender).find(x=>!x.name||x.name==='(미지정)'||x.name==='.');
+  document.getElementById('cFam-title').textContent=`${dimName}별 재고`;
+  document.getElementById('cFam-desc').innerHTML=
+    `수량 기준 상위` + (unk?` · <b>미분류 ${fmt(unk.qty)} EA (${unk.items}품목)</b> 는 제외`:'')
+    + (useFam?'':' · FAMILY 가 비어 있어 VENDER 로 표시');
+
+  const fam=dim.slice(0,8);
   ICH.fam=new Chart(document.getElementById('cFam'),{type:'bar',
-    data:{labels:fam.map(f=>f.name||'(미지정)'),datasets:[{data:fam.map(f=>f.qty),
+    data:{labels:fam.map(f=>f.name),datasets:[{data:fam.map(f=>f.qty),
       backgroundColor:BLUE,borderRadius:5,maxBarThickness:22}]},
     options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
       plugins:{legend:{display:false},tooltip:{callbacks:{
@@ -1153,6 +1406,31 @@ function renderInventory(){
       plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>fmt(c.raw)+' EA'}}},
       scales:{x:{grid:{color:'#f0f0f3'},ticks:{callback:v=>fmt(v)}},y:{grid:{display:false}}}}});
 
+  // 영업실별 재고 비교 — 전체 합계 화면에서만
+  const offs=Object.keys(INVS).filter(n=>n!=='전체 합계');
+  const grid=document.getElementById('offgrid');
+  if(INVK==='전체 합계' && offs.length>1){
+    grid.style.display='';
+    ICH.off=new Chart(document.getElementById('cOff'),{type:'bar',
+      data:{labels:offs,datasets:[
+        {label:'가용',data:offs.map(n=>INVS[n].avail_qty),backgroundColor:GREEN,
+         borderRadius:6,maxBarThickness:60},
+        {label:'예약',data:offs.map(n=>INVS[n].booking_qty),backgroundColor:AMBER,
+         borderRadius:6,maxBarThickness:60},
+      ]},
+      options:{responsive:true,maintainAspectRatio:false,
+        onClick:(e,el)=>{ if(el.length) selectInv(offs[el[0].index]); },
+        plugins:{legend:{position:'bottom',labels:{usePointStyle:true,boxWidth:8,padding:16}},
+          tooltip:{callbacks:{
+            afterBody:c=>{const n=offs[c[0].dataIndex];
+              return `품목 ${fmt(INVS[n].n_items)}건 · 총 재고 ${fmt(INVS[n].total_qty)} EA`;},
+            label:c=>c.dataset.label+': '+fmt(c.raw)+' EA'}}},
+        scales:{x:{stacked:true,grid:{display:false}},
+                y:{stacked:true,type:'logarithmic',grid:{color:'#f0f0f3'},
+                   ticks:{callback:v=>{const s=String(v);
+                     return /^[125]0*$/.test(s)?fmt(v):'';}}}}}});
+  }else{ grid.style.display='none'; }
+
   document.getElementById('in-all').textContent=I.items.length;
   document.getElementById('in-old').textContent=I.items.filter(x=>x.old>0).length;
   document.getElementById('in-bk').textContent=I.items.filter(x=>x.booking>0).length;
@@ -1167,7 +1445,8 @@ function showInvTab(t){
 }
 
 function drawInvTable(){
-  const I=DATA.inventory;
+  const I=INVS[INVK];
+  if(!I) return;
   const q=(document.getElementById('invq').value||'').trim().toUpperCase();
   let rows=I.items;
   if(ITAB==='old') rows=rows.filter(x=>x.old>0);
