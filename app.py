@@ -344,7 +344,7 @@ def _e(s):
     return (str(s) if s is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def compose_email_html(office, date, day):
+def compose_email_html(office, date, day, link=""):
     k = day.get("kpi", {})
     def fmt(n):
         try: return f"{round(float(n)):,}"
@@ -374,9 +374,14 @@ def compose_email_html(office, date, day):
               f'<th {th} style="text-align:right">수량</th><th {th}>담당</th><th {th}>비고</th></tr>'
               f'{in_rows}</table>') if day.get("in_rows") else '<p style="color:#999">입고 내역 없음</p>'
 
+    link_box = (f'<div style="background:#fbedec;border:1px solid #f0cfcf;border-radius:10px;padding:16px 18px;margin-bottom:18px">'
+                f'<div style="font-size:13px;color:#a93030;font-weight:700;margin-bottom:8px">🔗 {_e(office)} 실시간 대시보드</div>'
+                f'<a href="{_e(link)}" style="display:inline-block;background:#c43a3a;color:#fff;text-decoration:none;font-weight:800;font-size:14px;padding:11px 22px;border-radius:9px">대시보드 열기 →</a>'
+                f'<div style="font-size:12px;color:#888;margin-top:9px;word-break:break-all">{_e(link)}</div></div>') if link else ""
     return f"""<div style="font-family:'Malgun Gothic',sans-serif;color:#222;max-width:880px">
   <h2 style="margin:0 0 4px">{_e(office)} · 일일 입출고 리포트</h2>
   <div style="color:#666;font-size:13px;margin-bottom:14px">{_e(date)}</div>
+  {link_box}
   <div style="background:#f6f6f8;border-radius:8px;padding:12px 16px;font-size:13.5px;margin-bottom:18px">
     📦 입고 <b>{fmt(k.get('in_cnt'))}</b>건 / {fmt(k.get('in_qty'))} EA &nbsp;·&nbsp;
     🚚 출고 <b>{fmt(k.get('out_cnt'))}</b>건 / {fmt(k.get('out_qty'))} EA &nbsp;·&nbsp;
@@ -384,19 +389,35 @@ def compose_email_html(office, date, day):
   </div>
   <h3 style="margin:18px 0 0">🚚 출고 내역 ({fmt(k.get('out_cnt'))}건)</h3>{out_tbl}
   <h3 style="margin:22px 0 0">📦 입고 내역 ({fmt(k.get('in_cnt'))}건)</h3>{in_tbl}
-  <div style="color:#aaa;font-size:11px;margin-top:18px">자동 생성 · 사내 일일 입출고 엑셀 기준</div>
+  <div style="margin-top:24px;padding-top:14px;border-top:1px solid #e6e6ea;font-size:12.5px;color:#555">
+    문의: <b>유니트론텍 안성우 책임</b>
+  </div>
+  <div style="color:#aaa;font-size:11px;margin-top:8px">자동 생성 · 사내 일일 입출고 엑셀 기준</div>
 </div>"""
 
 
-def _send_smtp(emails, subject, body):
-    """SMTP 발송 (클라우드). 환경변수 SMTP_HOST/PORT/USER/PASS/MAIL_FROM 사용."""
+def resolve_smtp(cfg):
+    """SMTP 설정 결정: 요청(cfg) > 환경변수. host 없으면 None."""
+    cfg = cfg or {}
+    host = cfg.get("host") or os.environ.get("SMTP_HOST")
+    if not host:
+        return None
+    return dict(
+        host=host,
+        port=int(cfg.get("port") or os.environ.get("SMTP_PORT") or 587),
+        user=cfg.get("user") or os.environ.get("SMTP_USER") or "",
+        pw=cfg.get("pass") or os.environ.get("SMTP_PASS") or "",
+        sender=cfg.get("from") or cfg.get("user") or os.environ.get("MAIL_FROM")
+               or os.environ.get("SMTP_USER") or "no-reply@localhost",
+    )
+
+
+def _send_smtp(emails, subject, body, cfg):
+    """SMTP 발송. cfg = {host, port, user, pw, sender}."""
     import smtplib, ssl
     from email.mime.text import MIMEText
-    host = os.environ["SMTP_HOST"]
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    user = os.environ.get("SMTP_USER")
-    pw = os.environ.get("SMTP_PASS")
-    sender = os.environ.get("MAIL_FROM") or user or "no-reply@localhost"
+    host, port = cfg["host"], cfg["port"]
+    user, pw, sender = cfg["user"], cfg["pw"], cfg["sender"]
     msg = MIMEText(body, "html", "utf-8")
     msg["Subject"] = subject
     msg["From"] = sender
@@ -467,18 +488,20 @@ def send_sms(numbers, text):
 
 
 def send_email(payload):
-    """로컬 Outlook으로 회사메일 작성(검토 후 발송). SMTP_HOST 설정 시엔 SMTP 즉시발송."""
+    """실 링크(+요약·내역) 이메일 발송. SMTP 설정(요청/환경변수) 있으면 SMTP, 없으면 로컬 Outlook."""
     emails = [e for e in (payload.get("emails") or []) if e]
     office = payload.get("office", "")
     date = payload.get("date", "")
     day = payload.get("day") or {}
-    subject = f"[입출고 리포트] {office} · {date}"
-    body = compose_email_html(office, date, day)
-    if os.environ.get("SMTP_HOST"):                     # 클라우드(있을 때만)
+    link = payload.get("link", "")
+    subject = f"[입출고 대시보드] {office} · {date}"
+    body = compose_email_html(office, date, day, link)
+    cfg = resolve_smtp(payload.get("smtp"))
+    if cfg:                                             # SMTP (요청 설정 또는 환경변수)
         if not emails:
             raise ValueError("받는 사람 이메일을 입력하세요.")
-        return _send_smtp(emails, subject, body)
-    return _send_outlook(emails, subject, body, payload.get("send"))  # 받는사람 비어도 Outlook에서 입력
+        return _send_smtp(emails, subject, body, cfg)
+    return _send_outlook(emails, subject, body, payload.get("send"))  # 폴백: 로컬 Outlook
 
 
 # ---------------------------------------------------------------- HTTP
@@ -503,7 +526,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
-        if path == "/data":                              # 저장된 데이터(있으면)
+        if path == "/mailcfg":                           # 서버에 보내는 메일계정(SMTP) 설정됐나
+            self._send(200, json.dumps({"configured": bool(resolve_smtp(None))}))
+        elif path == "/data":                            # 저장된 데이터(있으면)
             if os.path.exists(DATA_FILE):
                 with open(DATA_FILE, encoding="utf-8") as f:
                     self._send(200, f.read())
@@ -649,7 +674,7 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
 <div id="land">
   <div class="box">
     <h1>일일 입출고 <span class="r">리포트</span></h1>
-    <p>영업실별 일일 입출고 엑셀을 <b style="color:#fff">한 번에 여러 개</b> 올리면, 실별로 각각 볼 수 있는 리포트로 정리합니다.<br>(예: 영업1,2실 / 3실 / 4실 / 5실 파일을 한꺼번에 — 전체 합계 탭도 자동 생성)</p>
+    <p>영업실별 일일 입출고 엑셀을 <b style="color:#fff">한 번에 여러 개</b> 올리면, 실별로 각각 볼 수 있는 리포트로 정리합니다.<br>(예: 영업1,2실 / 3실 / 4실 / 5실 파일을 한꺼번에 — 실별 링크 /12 /3 /4 /5)</p>
     <div id="drop">
       <div class="ic">📥</div>
       <div class="t">엑셀 파일들을 여기로 끌어다 놓거나 클릭 (여러 개 가능)</div>
@@ -708,6 +733,21 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
         <span id="smsstatus" style="font-size:12.5px;color:var(--mut)"></span>
       </div>
     </div>
+
+    <div class="card" id="emailcard" style="margin-top:22px">
+      <h2>📧 대시보드 링크 이메일 발송 <span style="font-size:12px;color:var(--mut);font-weight:500">— 각 실 담당자에게 그 실 링크 전송</span>
+        <button id="btn-smtp" style="float:right;font-size:12px;border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;font-family:inherit;font-weight:600">⚙️ 메일 설정</button></h2>
+      <p class="desc">받는 담당자 이메일을 넣고 발송하면 <b>지금 보고 있는 실의 링크</b>가 이메일로 전송됩니다. (실마다 따로 저장) · <b>전체 실 일괄 발송</b>은 모든 실에 각자 링크를 한 번에 보냅니다. · 보내는 계정은 <b>서버에 미리 설정</b>돼 있어 별도 설정 없이 발송됩니다. (⚙️는 로컬 테스트용)</p>
+      <div style="font-size:12.5px;color:#555;margin:0 0 12px;word-break:break-all;background:#f6f6f8;border-radius:9px;padding:9px 13px">
+        🔗 <b id="off-name2"></b> 링크: <span id="officelink2" style="color:var(--blue);font-weight:600"></span></div>
+      <textarea id="emailbox" rows="3" placeholder="seanlee@unitrontech.com" style="width:100%;font-size:14px;padding:12px 14px;border:1.5px solid var(--line);border-radius:11px;font-family:inherit;outline:none;resize:vertical"></textarea>
+      <div style="margin-top:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <button id="btn-email" class="confirmbtn">📧 이 실 링크 이메일 발송</button>
+        <button id="btn-email-all" class="confirmbtn" style="background:var(--ink)">📮 전체 실 일괄 발송</button>
+        <span id="emailstatus" style="font-size:12.5px;color:var(--mut)"></span>
+      </div>
+    </div>
+
     <div class="foot" id="foot"></div>
   </div>
 
@@ -745,12 +785,39 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
   </div>
 </div>
 
+<div id="smtpmodal" style="display:none;position:fixed;inset:0;background:rgba(20,20,26,.55);z-index:200;align-items:center;justify-content:center;padding:20px">
+  <div style="background:#fff;border-radius:16px;max-width:440px;width:100%;padding:24px 26px;box-shadow:0 20px 60px rgba(0,0,0,.4)">
+    <h2 style="margin:0 0 4px;font-size:17px;font-weight:800">⚙️ 메일 발송 설정 (SMTP)</h2>
+    <p style="font-size:12px;color:var(--mut);margin:0 0 16px;line-height:1.6">이메일 보내는 계정을 1회 등록합니다. (이 브라우저에만 저장) · Gmail: <b>smtp.gmail.com</b>/587 + <b>앱 비밀번호</b> · Office365: <b>smtp.office365.com</b>/587</p>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <label style="font-size:12px;color:#555;font-weight:600">SMTP 호스트<input id="s-host" type="text" placeholder="smtp.gmail.com" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
+      <div style="display:flex;gap:10px">
+        <label style="font-size:12px;color:#555;font-weight:600;width:90px">포트<input id="s-port" type="text" value="587" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
+        <label style="font-size:12px;color:#555;font-weight:600;flex:1">보내는 주소(From)<input id="s-from" type="text" placeholder="비우면 계정과 동일" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
+      </div>
+      <label style="font-size:12px;color:#555;font-weight:600">계정(아이디)<input id="s-user" type="text" placeholder="you@company.com" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
+      <label style="font-size:12px;color:#555;font-weight:600">비밀번호(앱 비밀번호)<input id="s-pass" type="password" style="width:100%;margin-top:4px;padding:9px 11px;border:1.5px solid var(--line);border-radius:9px;font-family:inherit;font-size:13px"></label>
+    </div>
+    <div style="margin-top:18px;display:flex;gap:10px;justify-content:flex-end">
+      <button id="smtp-cancel" style="background:#eee;border:none;font-family:inherit;font-size:13px;font-weight:700;padding:10px 18px;border-radius:9px;cursor:pointer;color:#555">닫기</button>
+      <button id="smtp-save" class="confirmbtn" style="padding:10px 20px">저장</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const fmt=n=>(n==null?'—':Number(n).toLocaleString('ko-KR'));
 const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const RED="#c43a3a",BLUE="#3a6ea5",GREEN="#3f9d6b",AMBER="#e0a93a",INK="#23232b";
 if(window.Chart){Chart.defaults.font.family="'Pretendard',system-ui,sans-serif";Chart.defaults.color="#6b6b74";Chart.defaults.font.size=12;}
-let DATA=null, O=null, OFFI=0;
+let DATA=null, O=null, OFFI=0, SERVER_MAIL=false;
+// 고정 수신자 — 처음 열었을 때 기본으로 채워진다 (화면에서 수정 가능, 실별로 저장됨)
+const DEFAULT_EMAILS='seanlee@unitrontech.com';
+// 서버에 보내는 메일계정(SMTP)이 설정돼 있으면, 사용자는 아무 설정 없이 발송 가능
+fetch('/mailcfg').then(r=>r.json()).then(d=>{ SERVER_MAIL=!!d.configured;
+  const b=document.getElementById('btn-smtp');
+  if(SERVER_MAIL && b){ b.textContent='✅ 메일 발송 준비됨'; b.title='서버에 발송 계정이 설정돼 있습니다'; }
+}).catch(()=>{});
 
 // 업로드 (여러 파일)
 const drop=document.getElementById('drop'),file=document.getElementById('file');
@@ -825,19 +892,9 @@ function showView(v){
   }else if(O){ showDay(CUR); }
 }
 function buildOffseg(){
+  // 각 실 페이지는 자기 실만 표시 — 다른 실로 가는 버튼 없음 (실 간 이동 불가)
   const seg=document.getElementById('offseg');
-  if(O.name==='전체 합계'){            // 전체 페이지: 모든 실 버튼 표시
-    seg.innerHTML='<span class="lab">영업실</span>'+DATA.offices.map((o,i)=>{
-      const all=o.name==='전체 합계'?' all':'';
-      const on=i===OFFI?' on':'';
-      return `<button class="${all}${on}" onclick="selectOffice(${i})">${esc(o.name)}</button>`;
-    }).join('');
-  }else{                              // 개별 실 페이지: 전체 합계 버튼만 (다른 실로 이동 불가)
-    const ai=DATA.offices.findIndex(o=>o.name==='전체 합계');
-    let h=`<span class="lab">${esc(O.name)}</span>`;
-    if(ai>=0) h+=`<button class="all" onclick="selectOffice(${ai})">← 전체 합계</button>`;
-    seg.innerHTML=h;
-  }
+  seg.innerHTML=`<span class="lab">영업실</span><button class="on" style="cursor:default" disabled>${esc(O.name)}</button>`;
 }
 function selectOffice(i){
   OFFI=i; O=DATA.offices[i];
@@ -862,6 +919,10 @@ function buildEmailCard(){
   document.getElementById('officelink').textContent=officeLink();
   document.getElementById('phonebox').value = localStorage.getItem('phones_'+O.name)||'';
   document.getElementById('smsstatus').textContent='';
+  document.getElementById('off-name2').textContent=O.name;
+  document.getElementById('officelink2').textContent=officeLink();
+  document.getElementById('emailbox').value = localStorage.getItem('emails_'+O.name)||DEFAULT_EMAILS;
+  document.getElementById('emailstatus').textContent='';
 }
 document.getElementById('btn-copy').onclick=()=>{
   navigator.clipboard.writeText(officeLink()).then(()=>{
@@ -883,6 +944,68 @@ document.getElementById('btn-sms').onclick=()=>{
     st.textContent = res.error ? ('오류: '+res.error)
       : `✅ ${O.name} 링크를 ${numbers.length}명에게 문자 발송했습니다.`;
   }).catch(e=>{ st.textContent='전송 오류: '+e; });
+};
+
+// ── SMTP 설정 (이 브라우저에 저장) ──
+function getSmtp(){ try{return JSON.parse(localStorage.getItem('smtp_config')||'{}');}catch(e){return {};} }
+const smtpModal=document.getElementById('smtpmodal');
+document.getElementById('btn-smtp').onclick=()=>{
+  const c=getSmtp();
+  document.getElementById('s-host').value=c.host||'';
+  document.getElementById('s-port').value=c.port||'587';
+  document.getElementById('s-from').value=c.from||'';
+  document.getElementById('s-user').value=c.user||'';
+  document.getElementById('s-pass').value=c.pass||'';
+  smtpModal.style.display='flex';
+};
+document.getElementById('smtp-cancel').onclick=()=>smtpModal.style.display='none';
+smtpModal.onclick=e=>{ if(e.target===smtpModal) smtpModal.style.display='none'; };
+document.getElementById('smtp-save').onclick=()=>{
+  const c={host:document.getElementById('s-host').value.trim(),
+    port:document.getElementById('s-port').value.trim()||'587',
+    from:document.getElementById('s-from').value.trim(),
+    user:document.getElementById('s-user').value.trim(),
+    pass:document.getElementById('s-pass').value};
+  if(!c.host){ alert('SMTP 호스트를 입력하세요.'); return; }
+  localStorage.setItem('smtp_config', JSON.stringify(c));
+  smtpModal.style.display='none';
+  document.getElementById('emailstatus').textContent='✅ 메일 설정 저장됨 — 이제 발송할 수 있어요.';
+};
+
+// ── 링크 이메일 발송 ──
+function officeLinkFor(name){ return location.origin+'/'+officeSlug(name); }
+function parseEmails(raw){ return [...new Set(String(raw||'').split(/[;,\s]+/).map(s=>s.trim()).filter(Boolean))]; }
+function sendOfficeEmail(office, emails){
+  const day=office.days[office.today_idx];
+  return fetch('/send',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({office:office.name, date:day.date, link:officeLinkFor(office.name),
+      emails, day, smtp:getSmtp()})}).then(r=>r.json());
+}
+document.getElementById('btn-email').onclick=()=>{
+  const st=document.getElementById('emailstatus');
+  if(!SERVER_MAIL && !getSmtp().host){ st.textContent='⚠️ 메일 발송 계정이 없습니다. (배포 시엔 서버에 설정되어 자동, 로컬 테스트는 ⚙️ 메일 설정)'; return; }
+  const raw=document.getElementById('emailbox').value.trim();
+  localStorage.setItem('emails_'+O.name, raw);
+  const emails=parseEmails(raw);
+  if(!emails.length){ st.textContent='⚠️ 받는 이메일을 입력하세요.'; return; }
+  st.textContent=`발송 중… (${emails.length}명)`;
+  sendOfficeEmail(O, emails).then(res=>{
+    st.textContent = res.error ? ('오류: '+res.error) : `✅ ${O.name} 링크를 ${emails.length}명에게 이메일 발송했습니다.`;
+  }).catch(e=>{ st.textContent='전송 오류: '+e; });
+};
+document.getElementById('btn-email-all').onclick=async()=>{
+  const st=document.getElementById('emailstatus');
+  if(!SERVER_MAIL && !getSmtp().host){ st.textContent='⚠️ 메일 발송 계정이 없습니다. (배포 시엔 서버에 설정되어 자동)'; return; }
+  localStorage.setItem('emails_'+O.name, document.getElementById('emailbox').value.trim());
+  const targets=DATA.offices.map(o=>({o, emails:parseEmails(localStorage.getItem('emails_'+o.name)||'')})).filter(t=>t.emails.length);
+  if(!targets.length){ st.textContent='⚠️ 저장된 실별 이메일이 없습니다. 각 실(/12 /3 /4 /5)에서 이메일을 입력·저장하세요.'; return; }
+  st.textContent=`전체 발송 중… (${targets.length}개 실)`;
+  let ok=0; const fail=[];
+  for(const t of targets){
+    try{ const res=await sendOfficeEmail(t.o, t.emails); if(res.error) fail.push(t.o.name+': '+res.error); else ok++; }
+    catch(e){ fail.push(t.o.name+': '+e); }
+  }
+  st.textContent=`✅ ${ok}개 실 발송 완료`+(fail.length?` · ⚠️ 실패 ${fail.length}건: `+fail.join(' / '):'');
 };
 
 function showUpload(){

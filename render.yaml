@@ -2,9 +2,29 @@ services:
   - type: web
     name: daily-dashboard
     runtime: python
-    plan: free
+    plan: starter                # 무료 플랜은 디스크를 못 붙임 → 업로드 데이터가 재시작마다 사라지고 메일 링크가 깨진다
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
+    disk:
+      name: data                 # 업로드 데이터(saved_data.json) 영속 저장 — 메일 링크가 계속 열리려면 필요
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: DATA_DIR
-        value: /tmp
+        value: /var/data
+      # 보내는 메일 계정 (Gmail 앱 비밀번호)
+      #   1. Google 계정 > 보안 > 2단계 인증 켜기
+      #   2. myaccount.google.com/apppasswords 에서 16자리 앱 비밀번호 생성
+      #   3. 아래 SMTP_USER / SMTP_PASS 를 Render 대시보드 Environment 에서 입력
+      #      (sync: false = 값이 저장소에 안 들어감)
+      #   회사 M365 계정으로 바꿀 때는 SMTP_HOST 만 smtp.office365.com 으로 교체하면 된다.
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER      # 발송할 지메일 주소
+        sync: false
+      - key: SMTP_PASS      # 앱 비밀번호 16자리 (공백 없이)
+        sync: false
+      - key: MAIL_FROM      # 비우면 SMTP_USER 와 동일
+        sync: false
