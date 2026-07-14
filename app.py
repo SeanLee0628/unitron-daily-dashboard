@@ -841,6 +841,68 @@ def send_email(payload):
     return _send_outlook(emails, subject, body, payload.get("send"))  # 폴백: 로컬 Outlook
 
 
+# ---------------------------------------------------------------- 자동 발송 (서버)
+# 발송은 업로드를 처리하는 서버 안에서 끝난다. 예전엔 업로더의 브라우저가 /send 를
+# 실별로 불렀는데, 업로드하고 탭을 닫으면 메일이 한 통도 안 나가고 기록도 안 남았다.
+
+# 고정 수신자. 키는 실 이름에서 뽑은 숫자 (영업5실 → '5', 영업1,2실 → '12').
+# 여기 없는 실은 DEFAULT_EMAILS 로 간다.
+# 스팸함 통과 여부를 확인하는 중이라 영업실 담당자들에게는 아직 안 보낸다.
+# 확인되면 4·5실 수신자에 아래를 더한다:
+#   "frankie@unitrontech.com", "mh.choi@unitrontech.com", "yj.park@unitrontech.com"
+DEFAULT_EMAILS = ["seanlee@unitrontech.com"]
+OFFICE_EMAILS = {                          # 4·5실 자료는 자재관리팀(안성우 책임)에게도 간다
+    "4": DEFAULT_EMAILS + ["sw.ahn@unitrontech.com"],
+    "5": DEFAULT_EMAILS + ["sw.ahn@unitrontech.com"],
+}
+
+
+def office_slug(name):
+    """실 이름 → URL 슬러그. 숫자만 뽑는다. 숫자가 없으면 'all' (= 전체 합계)."""
+    d = "".join(re.findall(r"\d", str(name)))
+    return d or "all"
+
+
+def smtp_ready():
+    """환경변수만으로 실제 발송이 가능한 상태인가.
+
+    host 만 보면 안 된다 — render.yaml 이 SMTP_HOST 를 하드코딩하고 있어서 계정이
+    비어 있어도 host 는 항상 잡힌다. 계정 없이 보내면 Gmail 이 거부한다.
+    """
+    cfg = resolve_smtp(None)
+    return bool(cfg and cfg["user"] and cfg["pw"])
+
+
+def send_office_emails(result, origin):
+    """업로드된 실마다 각자의 링크가 담긴 메일을 보낸다. '전체 합계'는 실이 아니므로 제외."""
+    out = {"ok": [], "fail": [], "error": ""}
+    offices = [o for o in (result.get("offices") or []) if o.get("name") != "전체 합계"]
+    if not offices:
+        return out
+    if not resolve_smtp(None):
+        out["error"] = "서버에 메일 계정(SMTP)이 설정돼 있지 않습니다."
+        return out
+
+    for o in offices:
+        name = o.get("name", "")
+        try:
+            days = o.get("days") or []
+            day = days[o.get("today_idx", 0)] if days else {}
+            send_email({
+                "office": name,
+                "date": day.get("date", ""),
+                "day": day,
+                "link": f"{origin.rstrip('/')}/{office_slug(name)}",
+                "emails": OFFICE_EMAILS.get(office_slug(name), DEFAULT_EMAILS),
+            })
+            out["ok"].append(name)
+        except Exception as e:                              # noqa: BLE001 — 한 실이 죽어도 나머지는 보낸다
+            out["fail"].append(f"{name} ({e})")
+            print(f"[mail] 발송 실패 {name}: {type(e).__name__}: {e}", flush=True)
+    print(f"[mail] 성공 {out['ok']} / 실패 {out['fail']}", flush=True)
+    return out
+
+
 # ---------------------------------------------------------------- HTTP
 def chart_js():
     if os.path.exists(CHART_JS):
@@ -865,7 +927,7 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/mailcfg":                           # 서버 설정 상태 (메일계정 / 엑셀 비밀번호)
             # 비밀번호 자체는 절대 안 내려보낸다. 있는지 없는지만.
-            self._send(200, json.dumps({"configured": bool(resolve_smtp(None)),
+            self._send(200, json.dumps({"configured": smtp_ready(),
                                         "pw": bool(DEFAULT_PW)}))
         elif path == "/data":                            # 저장된 데이터(있으면)
             if os.path.exists(DATA_FILE):
@@ -888,6 +950,9 @@ class Handler(BaseHTTPRequestHandler):
                         json.dump(result, f, ensure_ascii=False)
                 except Exception:
                     pass
+                # 발송은 여기서 끝낸다. 업로더가 탭을 닫아도 메일은 나간다.
+                origin = payload.get("origin") or f"http://{self.headers.get('Host', 'localhost')}"
+                result["mail"] = send_office_emails(result, origin)
             elif self.path == "/export":
                 data = export_xlsx(payload)
                 self.send_response(200)
@@ -1031,7 +1096,7 @@ td.old{color:var(--red);font-weight:800;}
 .tabbtn{font-size:13px;font-weight:700;padding:9px 18px;border:none;background:#ececf1;color:#666;border-radius:10px 10px 0 0;cursor:pointer;font-family:inherit;}
 .tabbtn.on{background:#fff;color:var(--ink);box-shadow:0 -2px 8px rgba(0,0,0,.04);}
 .tabbtn .n{font-size:11px;color:var(--mut);margin-left:5px;font-weight:600;}
-.tablewrap{background:#fff;border-radius:0 16px 16px 16px;box-shadow:0 1px 2px rgba(0,0,0,.04),0 6px 22px rgba(0,0,0,.05);overflow:hidden;}
+.tablewrap{background:#fff;border-radius:0 16px 16px 16px;box-shadow:0 1px 2px rgba(0,0,0,.04),0 6px 22px rgba(0,0,0,.05);overflow:hidden;margin-bottom:26px;}
 .scroll{max-height:520px;overflow:auto;}
 table{width:100%;border-collapse:collapse;font-size:12.5px;}
 thead th{position:sticky;top:0;background:#fafafb;color:var(--mut);font-weight:700;font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;text-align:left;padding:11px 14px;border-bottom:1.5px solid var(--line);z-index:1;}
@@ -1095,6 +1160,11 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     <div class="dayseg" id="dayseg"></div>
     <div class="kpis" id="kpis"></div>
     <div class="hl" id="hl" style="display:none"></div>
+    <div class="tabs">
+      <button class="tabbtn on" id="tb-out" onclick="showTab('out')">출고 내역<span class="n" id="n-out"></span></button>
+      <button class="tabbtn" id="tb-in" onclick="showTab('in')">입고 내역<span class="n" id="n-in"></span></button>
+    </div>
+    <div class="tablewrap"><div class="scroll" id="tablearea"></div></div>
     <div class="grid">
       <div class="card"><h2>어제 vs 오늘 물동</h2><p class="desc">입고·출고 수량 비교</p><div class="cbox"><canvas id="cCompare"></canvas></div></div>
       <div class="card"><h2>오늘 출고 Top 거래처</h2><p class="desc">수량 기준 상위</p><div class="cbox"><canvas id="cCust"></canvas></div></div>
@@ -1103,11 +1173,6 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       <div class="card"><h2>담당자별 처리 건수</h2><p class="desc">오늘 입고+출고</p><div class="cbox"><canvas id="cSales"></canvas></div></div>
       <div class="card" id="splitcard"><h2>오늘 요약</h2><p class="desc">한눈에</p><div id="summary"></div></div>
     </div>
-    <div class="tabs">
-      <button class="tabbtn on" id="tb-out" onclick="showTab('out')">출고 내역<span class="n" id="n-out"></span></button>
-      <button class="tabbtn" id="tb-in" onclick="showTab('in')">입고 내역<span class="n" id="n-in"></span></button>
-    </div>
-    <div class="tablewrap"><div class="scroll" id="tablearea"></div></div>
 
     <!-- 자동 발송 결과만 표시. 수동 발송(문자/이메일) UI는 없앴다. -->
     <div class="hl" id="mailnotice" style="display:none;margin-top:22px">
@@ -1164,31 +1229,17 @@ const fmt=n=>(n==null?'—':Number(n).toLocaleString('ko-KR'));
 const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const RED="#c43a3a",BLUE="#3a6ea5",GREEN="#3f9d6b",AMBER="#e0a93a",INK="#23232b";
 if(window.Chart){Chart.defaults.font.family="'Pretendard',system-ui,sans-serif";Chart.defaults.color="#6b6b74";Chart.defaults.font.size=12;}
-let DATA=null, O=null, OFFI=0, SERVER_MAIL=false;
+let DATA=null, O=null, OFFI=0;
 let INVS={}, INVK=null, INVNAMES=[], VIEW='io';   // 실별 재고 / 선택된 실 / 볼 수 있는 실 / 현재 뷰
 
 // 각 실 페이지(/12 /3 /4 /5)는 자기 실 것만 본다. 재고도 마찬가지.
 // selectOffice 가 주소를 바꾸므로 시작할 때 한 번 붙잡아 둔다.
 const URLSLUG=location.pathname.replace(/\//g,'');
 
-// ── 고정 수신자 ──────────────────────────────────────────────
-// 키는 실 이름에서 뽑은 숫자 (예: '영업4실'/'Inv4' → '4', '영업1,2실' → '12').
-// 여기 없는 실은 DEFAULT_EMAILS 로 간다.
-// 스팸함 통과 여부를 확인하는 중이라 영업실 담당자들에게는 아직 안 보낸다.
-// 확인되면 4·5실 수신자에 아래를 더한다:
-//   'frankie@unitrontech.com','mh.choi@unitrontech.com','yj.park@unitrontech.com'
-const DEFAULT_EMAILS='seanlee@unitrontech.com';
-const OFFICE_EMAILS={                         // 4·5실 자료는 자재관리팀(안성우 책임)에게도 간다
-  '4': DEFAULT_EMAILS+', sw.ahn@unitrontech.com',
-  '5': DEFAULT_EMAILS+', sw.ahn@unitrontech.com',
-};
-function emailsFor(name){
-  return parseEmails(OFFICE_EMAILS[officeSlug(name)]||DEFAULT_EMAILS);
-}
-// 서버에 보내는 메일계정(SMTP)이 설정돼 있으면 업로드 직후 자동 발송된다.
+// 수신자 목록과 발송은 서버(app.py 의 OFFICE_EMAILS / send_office_emails)가 들고 있다.
+// 브라우저는 결과만 받아 보여준다 — 업로드하고 탭을 닫아도 메일은 나가야 하니까.
 // 서버에 엑셀 비밀번호(XLSX_PW)가 없으면 비밀번호 칸을 펼쳐 둔다 — 안 그러면 업로드가 그냥 실패한다.
 fetch('/mailcfg').then(r=>r.json()).then(d=>{
-  SERVER_MAIL=!!d.configured;
   if(!d.pw){
     document.getElementById('pwrow').style.display='flex';
     document.getElementById('pwtoggle').style.display='none';
@@ -1225,11 +1276,12 @@ function go(files){
     rd.readAsDataURL(f);
   }))).then(arr=>{
     fetch('/build',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({files:arr, password:document.getElementById('pw').value})})
+      body:JSON.stringify({files:arr, password:document.getElementById('pw').value,
+                           origin:location.origin})})
     .then(r=>r.json()).then(res=>{
       document.getElementById('loading').style.display='none';
       if(res.error){ const e=document.getElementById('errmsg'); e.textContent='오류: '+res.error; e.style.display='block'; return; }
-      DATA=res; renderApp(); autoSend();
+      DATA=res; renderApp(); showMailResult(res.mail);
     }).catch(e=>{document.getElementById('loading').style.display='none';
       const el=document.getElementById('errmsg'); el.textContent='전송 오류: '+e; el.style.display='block';});
   }).catch(e=>{document.getElementById('loading').style.display='none';
@@ -1336,51 +1388,20 @@ function renderOffice(){
 function officeSlug(name){ const d=(String(name).match(/\d/g)||[]).join(''); return d||'all'; }
 function officeLink(){ return location.origin+'/'+officeSlug(O.name); }
 
-// 로컬 테스트용 SMTP 설정(브라우저 저장). 배포본은 서버 환경변수를 쓰므로 보통 비어 있다.
-function getSmtp(){ try{return JSON.parse(localStorage.getItem('smtp_config')||'{}');}catch(e){return {};} }
-
-// ── 링크 이메일 발송 ──
-function officeLinkFor(name){ return location.origin+'/'+officeSlug(name); }
-function parseEmails(raw){ return [...new Set(String(raw||'').split(/[;,\s]+/).map(s=>s.trim()).filter(Boolean))]; }
-function sendOfficeEmail(office, emails){
-  const day=office.days[office.today_idx];
-  return fetch('/send',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({office:office.name, date:day.date, link:officeLinkFor(office.name),
-      emails, day, smtp:getSmtp()})}).then(r=>r.json());
-}
-// ── 업로드 완료 시 자동 발송 (전송 버튼을 누르지 않아도 나간다) ──
-// 실별로 각자의 링크가 담긴 메일이 나간다. '전체 합계'는 실이 아니므로 제외.
-function notice(msg){
+// ── 자동 발송 결과 표시 ──
+// 발송 자체는 서버가 /build 안에서 이미 끝냈다. 여기서는 결과만 보여준다.
+// 그래서 이 배너를 못 보고 탭을 닫아도 메일은 이미 나간 뒤다.
+function showMailResult(m){
   const box=document.getElementById('mailnotice');
   const st=document.getElementById('emailstatus');
-  if(!box||!st) return;
-  st.innerHTML=msg;
+  if(!box||!st||!m) return;
+  const ok=m.ok||[], fail=m.fail||[];
+  if(!ok.length && !fail.length && !m.error) return;
+  st.innerHTML=
+    (m.error?`⚠️ 자동 발송 안 됨 — ${esc(m.error)}`:'')+
+    (ok.length?`✅ 자동 발송 완료 — <b>${esc(ok.join(', '))}</b>`:'')+
+    (fail.length?`${ok.length?' · ':''}❌ 실패: ${esc(fail.join(', '))}`:'');
   box.style.display='flex';
-}
-
-async function autoSend(){
-  const targets=(DATA.offices||[])
-    .filter(o=>o.name!=='전체 합계')
-    .map(o=>({o, emails:emailsFor(o.name)}))
-    .filter(t=>t.emails.length);
-  if(!targets.length) return;
-
-  if(!SERVER_MAIL && !getSmtp().host){
-    notice('⚠️ 자동 발송 안 됨 — 서버에 메일 계정(SMTP)이 설정돼 있지 않습니다.');
-    return;
-  }
-  notice(`업로드 완료 — 자동 발송 중… (${targets.length}개 실)`);
-
-  const ok=[], fail=[];
-  for(const t of targets){
-    try{
-      const r=await sendOfficeEmail(t.o, t.emails);
-      (r && r.ok && r.sent ? ok : fail).push(t.o.name+(r&&r.error?(' ('+r.error+')'):''));
-    }catch(e){ fail.push(t.o.name+' ('+e+')'); }
-  }
-  notice(
-    (ok.length?`✅ 자동 발송 완료 — <b>${ok.join(', ')}</b>`:'')+
-    (fail.length?`${ok.length?' · ':''}❌ 실패: ${fail.join(', ')}`:''));
 }
 
 function showUpload(){
