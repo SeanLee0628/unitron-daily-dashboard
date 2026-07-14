@@ -1188,6 +1188,21 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     <div class="offseg" id="inv-offseg"></div>
     <div class="kpis" id="inv-kpis"></div>
     <div class="hl" id="inv-hl" style="display:none"></div>
+
+    <!-- 품목 표를 차트보다 먼저 — 입출고 화면과 같은 순서(KPI → 표 → 차트) -->
+    <div class="tabs">
+      <button class="tabbtn on" id="ib-all" onclick="showInvTab('all')">전체 품목<span class="n" id="in-all"></span></button>
+      <button class="tabbtn" id="ib-old" onclick="showInvTab('old')">장기재고<span class="n" id="in-old"></span></button>
+      <button class="tabbtn" id="ib-bk" onclick="showInvTab('bk')">예약분<span class="n" id="in-bk"></span></button>
+    </div>
+    <div class="tablewrap">
+      <div style="padding:12px 16px;border-bottom:1px solid var(--line)">
+        <input id="invq" placeholder="Part# / MOBIS ID / FAMILY / 담당 검색…"
+          style="width:100%;max-width:420px;font-size:13.5px;padding:9px 13px;border:1.5px solid var(--line);border-radius:10px;font-family:inherit;outline:none">
+      </div>
+      <div class="scroll" id="invtable"></div>
+    </div>
+
     <div class="grid">
       <div class="card"><h2 id="cAge-title">재고 노후화 (Datecode 연도별)</h2>
         <p class="desc" id="cAge-desc">—</p>
@@ -1206,19 +1221,6 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       <div class="card" style="grid-column:1/-1"><h2>영업실별 재고</h2>
         <p class="desc">실별 재고 수량 비교 · 클릭하면 해당 실로 이동</p>
         <div class="cbox"><canvas id="cOff"></canvas></div></div>
-    </div>
-
-    <div class="tabs">
-      <button class="tabbtn on" id="ib-all" onclick="showInvTab('all')">전체 품목<span class="n" id="in-all"></span></button>
-      <button class="tabbtn" id="ib-old" onclick="showInvTab('old')">장기재고<span class="n" id="in-old"></span></button>
-      <button class="tabbtn" id="ib-bk" onclick="showInvTab('bk')">예약분<span class="n" id="in-bk"></span></button>
-    </div>
-    <div class="tablewrap">
-      <div style="padding:12px 16px;border-bottom:1px solid var(--line)">
-        <input id="invq" placeholder="Part# / MOBIS ID / FAMILY / 담당 검색…"
-          style="width:100%;max-width:420px;font-size:13.5px;padding:9px 13px;border:1.5px solid var(--line);border-radius:10px;font-family:inherit;outline:none">
-      </div>
-      <div class="scroll" id="invtable"></div>
     </div>
     <div class="foot" id="inv-foot"></div>
   </div>
