@@ -665,8 +665,8 @@ def compose_email_html(office, date, day=None, link=""):
         f'</td></tr></table>'
     ) if link else ""
 
-    raw = (f'<div style="margin-top:14px;font-size:11.5px;color:{MUT};'
-           f'word-break:break-all;line-height:1.6">{_e(link)}</div>') if link else ""
+    # 버튼 아래에 URL 을 그대로 한 번 더 노출하던 블록은 뺐다. 같은 링크가 본문에
+    # 두 번 나오는 형태는 스팸 필터가 싫어한다. 텍스트 버전에는 URL 이 그대로 남아 있다.
 
     return f"""<!DOCTYPE html>
 <html><body style="margin:0;padding:0;background:#f2f2f5">
@@ -701,7 +701,6 @@ def compose_email_html(office, date, day=None, link=""):
         <div style="font-size:13.5px;color:#4a4a52;line-height:1.75;margin-bottom:22px">
           해당 일자의 입출고 내역과 재고현황을 아래에서 조회하실 수 있습니다.</div>
         {cta}
-        {raw}
       </td></tr>
 
       <!-- 푸터 -->
@@ -740,7 +739,7 @@ def _send_smtp(emails, subject, body, cfg, text=None):
     import smtplib, ssl
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
-    from email.utils import formataddr
+    from email.utils import formataddr, formatdate, make_msgid
     host, port = cfg["host"], cfg["port"]
     user, pw, sender = cfg["user"], cfg["pw"], cfg["sender"]
 
@@ -758,6 +757,13 @@ def _send_smtp(emails, subject, body, cfg, text=None):
     msg["To"] = ", ".join(emails)
     # 답장은 발송용 계정이 아니라 문의처로 가야 한다
     msg["Reply-To"] = formataddr((CONTACT_NAME, CONTACT_MAIL))
+    # Date/Message-ID 가 없는 메일은 스팸 점수가 올라간다. 지메일 릴레이는 없으면 채워주지만
+    # 회사 M365(smtp.office365.com) 로 바꾸면 안 채워준다 — 직접 넣어둔다.
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=sender.split("@")[-1] if "@" in sender else None)
+    # 자동 발송 메일임을 명시 → 부재중 자동응답이 되돌아오지 않는다 (RFC 3834 / M365)
+    msg["Auto-Submitted"] = "auto-generated"
+    msg["X-Auto-Response-Suppress"] = "OOF, AutoReply"
     with smtplib.SMTP(host, port, timeout=25) as s:
         s.ehlo()
         try:
@@ -830,7 +836,8 @@ def send_email(payload):
     date = payload.get("date", "")
     day = payload.get("day") or {}
     link = payload.get("link", "")
-    subject = f"[입출고 및 재고현황 {date}]"
+    # 제목이 '['로 시작하면 스팸 필터가 광고성 머리말로 본다. 회사명 + 실 + 날짜로 푼다.
+    subject = " ".join(x for x in ("유니트론텍 입출고 및 재고현황", office, date) if x)
     body = compose_email_html(office, date, day, link)
     text = compose_email_text(office, date, link)
     cfg = resolve_smtp(payload.get("smtp"))
@@ -847,10 +854,15 @@ def send_email(payload):
 
 # 고정 수신자. 키는 실 이름에서 뽑은 숫자 (영업5실 → '5', 영업1,2실 → '12').
 # 여기 없는 실은 DEFAULT_EMAILS 로 간다.
-# 스팸함 통과 여부를 확인하는 중이라 영업실 담당자들에게는 아직 안 보낸다.
-# 확인되면 4·5실 수신자에 아래를 더한다:
+# 아래 세 명(gy.choi/lindsay/hskang)은 2026-07-28 부터 전 실 공통 수신.
+# 스팸함 통과가 아직 확인 안 된 사람들이 남아 있다 — 확인되면 4·5실 수신자에 아래를 더한다:
 #   "frankie@unitrontech.com", "mh.choi@unitrontech.com", "yj.park@unitrontech.com"
-DEFAULT_EMAILS = ["seanlee@unitrontech.com"]
+DEFAULT_EMAILS = [
+    "seanlee@unitrontech.com",
+    "gy.choi@unitrontech.com",
+    "lindsay@unitrontech.com",
+    "hskang@unitrontech.com",
+]
 OFFICE_EMAILS = {                          # 4·5실 자료는 자재관리팀(안성우 책임)에게도 간다
     "4": DEFAULT_EMAILS + ["sw.ahn@unitrontech.com"],
     "5": DEFAULT_EMAILS + ["sw.ahn@unitrontech.com"],
