@@ -310,8 +310,23 @@ def log_prune(keep):
         cx.close()
 
 
-def _log_where(office, dfrom, dto, q):
-    """조회 조건 → (SQL 조각, 인자). 검색어는 공백으로 나눠 전부 포함(AND)."""
+# 검색·정렬에서 쓸 수 있는 칸. 화면 드롭다운과 1:1 이고, 여기 없는 이름은 무시한다
+# (정렬 키가 SQL 에 그대로 들어가므로 화이트리스트가 곧 주입 차단이다).
+LOG_FIELDS = {"customer": "customer", "part": "part", "sales": "sales",
+              "doc": "doc", "mcode": "mcode", "remark": "remark", "date": "date",
+              "fab": "fab"}
+LOG_ALL_COLS = ["customer", "part", "sales", "doc", "mcode", "remark"]
+LOG_SORTS = dict(LOG_FIELDS, qty="qty")
+FIELD_KO = {"customer": "거래처", "part": "PART#", "sales": "담당",
+            "doc": "문서번호", "mcode": "Material Code", "remark": "비고", "date": "일자"}
+
+
+def _log_where(office, dfrom, dto, conds):
+    """조회 조건 → (SQL 조각, 인자).
+
+    conds 는 [(칸, 값)] 이고 전부 AND 다. 칸이 'all'(또는 빈 값)이면 모든 칸을 훑는다.
+    한 칸 안에서는 공백으로 나눈 단어를 다시 AND 로 묶는다.
+    """
     where, args = [], []
     if office and office != ALL:                    # 전체 합계 = 실 구분 없이 전부
         where.append("office=?"); args.append(office)
@@ -319,18 +334,27 @@ def _log_where(office, dfrom, dto, q):
         where.append("date>=?"); args.append(dfrom)
     if dto:
         where.append("date<=?"); args.append(dto)
-    for term in (q or "").split():
-        like = f"%{term}%"
-        where.append("(customer LIKE ? OR part LIKE ? OR sales LIKE ? OR doc LIKE ? "
-                     "OR mcode LIKE ? OR remark LIKE ?)")
-        args += [like] * 6
+    for field, val in conds or []:
+        col = LOG_FIELDS.get(field)
+        for term in clean(val).split():
+            like = f"%{term}%"
+            if col:
+                where.append(f"{col} LIKE ?"); args.append(like)
+            else:                                   # 전체 검색
+                where.append("(" + " OR ".join(f"{c} LIKE ?" for c in LOG_ALL_COLS) + ")")
+                args += [like] * len(LOG_ALL_COLS)
     return (" AND ".join(where) or "1=1"), args
 
 
-def log_query(office, dfrom, dto, q, limit=LOG_MAX_ROWS):
+def log_query(office, dfrom, dto, conds, sort="date", direction="desc",
+              limit=LOG_MAX_ROWS):
     """기간+검색으로 입고/출고를 각각 집계하고 행을 돌려준다.
-    건수·수량은 상한과 무관하게 조건에 맞는 전체 기준이다."""
-    sql, args = _log_where(office, dfrom, dto, q)
+    건수·수량은 상한과 무관하게 조건에 맞는 전체 기준이다.
+    정렬을 서버가 하는 이유: 상한(3,000행) 때문에 화면에서 정렬하면 그 안에서만 섞인다."""
+    sql, args = _log_where(office, dfrom, dto, conds)
+    col = LOG_SORTS.get(sort, "date")
+    asc = "ASC" if str(direction).lower() == "asc" else "DESC"
+    order = f"{col} {asc}, rowid DESC" if col != "date" else f"date {asc}, rowid DESC"
     out = {}
     cx = log_conn()
     try:
@@ -342,7 +366,7 @@ def log_query(office, dfrom, dto, q, limit=LOG_MAX_ROWS):
                          doc=g, mcode=h, remark=i, fab=j)
                     for a, b, c, e, f, g, h, i, j in cx.execute(
                         f"SELECT date,customer,part,qty,sales,doc,mcode,remark,fab "
-                        f"FROM log WHERE dir=? AND {sql} ORDER BY date DESC, rowid DESC "
+                        f"FROM log WHERE dir=? AND {sql} ORDER BY {order} "
                         f"LIMIT ?", [d] + args + [limit])]
             out[d] = dict(cnt=cnt, qty=round(qty), customers=custs,
                           rows=rows, shown=len(rows), truncated=cnt > len(rows))
@@ -898,9 +922,15 @@ def export_xlsx(payload):
     elif view == "log":
         # 화면은 상한(LOG_MAX_ROWS)까지만 보여주지만 엑셀은 조건에 맞는 전체를 낸다.
         # 그래서 브라우저가 보낸 행을 쓰지 않고 같은 조건으로 서버가 다시 조회한다.
-        dfrom, dto, q = payload.get("from", ""), payload.get("to", ""), payload.get("q", "")
-        res = log_query(office, dfrom, dto, q, limit=1000000)
-        span = f"{dfrom or '처음'} ~ {dto or '끝'}" + (f" · 검색 '{q}'" if q else "")
+        dfrom, dto = payload.get("from", ""), payload.get("to", "")
+        conds = [(c.get("f", ""), c.get("v", "")) for c in payload.get("conds") or []
+                 if c.get("v")]
+        res = log_query(office, dfrom, dto, conds, payload.get("sort") or "date",
+                        payload.get("dir") or "desc", limit=1000000)
+        span = f"{dfrom or '처음'} ~ {dto or '끝'}"
+        if conds:
+            span += " · " + " AND ".join(
+                f"{FIELD_KO.get(f, '전체')}='{v}'" for f, v in conds)
         sheet("요약", f"입출고 이력 · {office} · {span}",
               ["항목", "값"],
               [["기간", span], ["입고 건수", res["in"]["cnt"]], ["입고 수량", res["in"]["qty"]],
@@ -1303,9 +1333,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/log":                             # 기간 조회 (입출고 이력)
             q = urllib.parse.parse_qs(self.path.partition("?")[2])
             g = lambda k: (q.get(k) or [""])[0].strip()   # noqa: E731
+            conds = [(g("f1"), g("v1")), (g("f2"), g("v2"))]
+            conds = [(f, v) for f, v in conds if v]
             try:
                 self._send(200, json.dumps(
-                    log_query(g("office"), g("from"), g("to"), g("q")),
+                    log_query(g("office"), g("from"), g("to"), conds,
+                              g("sort") or "date", g("dir") or "desc"),
                     ensure_ascii=False))
             except Exception as e:  # noqa: BLE001
                 self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"},
@@ -1445,6 +1478,27 @@ header .reload{position:absolute;right:40px;top:30px;background:rgba(255,255,255
 .logbar .sep{width:1px;height:22px;background:var(--line);margin:0 2px;}
 .logbar .note{font-size:11.5px;color:var(--mut);width:100%;padding-top:2px;}
 .trunc{padding:10px 16px;background:#fff8e6;color:#8a6d1f;font-size:12px;border-bottom:1px solid var(--line);}
+/* 칸 지정 2개 AND 검색줄 (입출고 표 / 재고 표 공용) */
+.srch{display:flex;flex-wrap:wrap;align-items:center;gap:7px;padding:12px 16px;border-bottom:1px solid var(--line);}
+.srch .fsel{font-family:inherit;font-size:12.5px;font-weight:700;color:var(--ink);background:#fff;
+  border:1.5px solid var(--line);border-radius:9px;padding:8px 9px;outline:none;cursor:pointer;}
+.srch .fval{font-family:inherit;font-size:13px;padding:8px 12px;border:1.5px solid var(--line);
+  border-radius:9px;outline:none;min-width:130px;flex:1 1 130px;max-width:230px;}
+.srch .fval:focus,.srch .fsel:focus{border-color:var(--red);}
+.srch .andlab{font-size:11px;font-weight:800;color:var(--mut);letter-spacing:.5px;}
+.srch .go{border:none;background:var(--red);color:#fff;font-family:inherit;font-size:12.5px;
+  font-weight:800;padding:9px 16px;border-radius:9px;cursor:pointer;}
+.srch .go:hover{background:var(--red2);}
+.srch .off{border:1.5px solid var(--line);background:#fff;font-family:inherit;font-size:12.5px;
+  font-weight:700;color:#777;padding:8px 13px;border-radius:9px;cursor:pointer;}
+.srch .off:hover{border-color:#cfcfd6;color:var(--ink);}
+.srch .hit{font-size:12px;color:var(--mut);font-weight:600;}
+/* 정렬 가능한 헤더 */
+th.s{cursor:pointer;user-select:none;white-space:nowrap;}
+th.s:hover{color:var(--red);}
+th.s .ar{font-size:9px;color:#c4c4cc;margin-left:3px;}
+th.s.on{color:var(--red);}
+th.s.on .ar{color:var(--red);}
 td.dt{font-variant-numeric:tabular-nums;color:#666;white-space:nowrap;}
 .kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:26px;}
 @media(max-width:1080px){.kpis{grid-template-columns:repeat(3,1fr);}}
@@ -1579,9 +1633,6 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       <button class="pre" data-k="m3"  onclick="logPreset('m3')">3개월</button>
       <button class="pre" data-k="y"   onclick="logPreset('y')">올해</button>
       <button class="pre" data-k="all" onclick="logPreset('all')">전체</button>
-      <span class="sep"></span>
-      <input class="q" id="lg-q" placeholder="거래처 / PART# / 담당 / 비고 검색… (띄어쓰기로 여러 단어)">
-      <button class="go" onclick="runLog()">조회</button>
       <button class="off" id="lg-off" onclick="exitLog()" style="display:none">← 하루 보기</button>
       <div class="note" id="lg-note"></div>
     </div>
@@ -1592,7 +1643,20 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       <button class="tabbtn on" id="tb-out" onclick="showTab('out')">출고 내역<span class="n" id="n-out"></span></button>
       <button class="tabbtn" id="tb-in" onclick="showTab('in')">입고 내역<span class="n" id="n-in"></span></button>
     </div>
-    <div class="tablewrap"><div class="scroll" id="tablearea"></div></div>
+    <div class="tablewrap">
+      <!-- 칸 지정 2개 AND. 하루 보기와 기간 조회 양쪽에 그대로 적용된다 -->
+      <div class="srch" id="io-srch">
+        <select class="fsel" id="io-f1"></select>
+        <input class="fval" id="io-v1" placeholder="값 입력…">
+        <span class="andlab">AND</span>
+        <select class="fsel" id="io-f2"></select>
+        <input class="fval" id="io-v2" placeholder="값 입력…">
+        <button class="go" onclick="applyIoSearch()">조회</button>
+        <button class="off" onclick="clearIoSearch()">초기화</button>
+        <span class="hit" id="io-hit"></span>
+      </div>
+      <div class="scroll" id="tablearea"></div>
+    </div>
     <div class="grid" id="iogrid1">
       <div class="card"><h2>어제 vs 오늘 물동</h2><p class="desc">입고·출고 수량 비교</p><div class="cbox"><canvas id="cCompare"></canvas></div></div>
       <div class="card"><h2>오늘 출고 Top 거래처</h2><p class="desc">수량 기준 상위</p><div class="cbox"><canvas id="cCust"></canvas></div></div>
@@ -1624,9 +1688,15 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       <button class="tabbtn" id="ib-bk" onclick="showInvTab('bk')">예약분<span class="n" id="in-bk"></span></button>
     </div>
     <div class="tablewrap">
-      <div style="padding:12px 16px;border-bottom:1px solid var(--line)">
-        <input id="invq" placeholder="Part# / MOBIS ID / FAMILY / 담당 검색…"
-          style="width:100%;max-width:420px;font-size:13.5px;padding:9px 13px;border:1.5px solid var(--line);border-radius:10px;font-family:inherit;outline:none">
+      <div class="srch" id="inv-srch">
+        <select class="fsel" id="inv-f1"></select>
+        <input class="fval" id="inv-v1" placeholder="값 입력…">
+        <span class="andlab">AND</span>
+        <select class="fsel" id="inv-f2"></select>
+        <input class="fval" id="inv-v2" placeholder="값 입력…">
+        <button class="go" onclick="renderInvTable()">조회</button>
+        <button class="off" onclick="clearInvSearch()">초기화</button>
+        <span class="hit" id="inv-hit"></span>
       </div>
       <div class="scroll" id="invtable"></div>
     </div>
@@ -1783,7 +1853,7 @@ function exportXlsx(){
       ? {office:O.name, view:'log', ...LOGARGS}
       : {office:O.name, view:'io', day:O.days[CUR]};
   const label = VIEW==='inv' ? `재고_${INVK}`
-    : LOGMODE ? `입출고이력_${O.name}_${LOGARGS.from}_${LOGARGS.to}`
+    : LOGMODE ? `입출고이력_${O.name}_${LOGARGS.from||'처음'}_${LOGARGS.to||'끝'}`
     : `입출고_${O.name}_${O.days[CUR].date}`;
   b.disabled=true; b.textContent='⏳ 만드는 중…';
   fetch('/export',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1951,19 +2021,42 @@ function buildSummary(day, prev, tag){
 }
 
 function emptyMsg(){return '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">이 날짜의 내역이 없습니다</div>';}
+function noHit(){return '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조건에 맞는 내역이 없습니다</div>';}
+
+const IO_ALL=r=>[r.customer,r.part,r.sales,r.doc,r.remark,r.fab];
+let DSORT={k:'',d:0};                      // 하루 보기 정렬 (기본 = 엑셀 순서)
+
+function sortDay(key){ nextDir(DSORT,key); buildTables(O.days[CUR]); showTab(TBcur); }
+
 function buildTables(day){
-  document.getElementById('n-out').textContent=day.out_rows.length;
-  document.getElementById('n-in').textContent=day.in_rows.length;
-  const out=!day.out_rows.length?emptyMsg():`<table><thead><tr><th>#</th><th>거래처</th><th>PART#</th><th class="n">수량</th><th>담당</th><th>문서번호</th><th>비고</th></tr></thead><tbody>${
-    day.out_rows.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
+  const conds=condsOf('io');
+  let outR=applyConds(day.out_rows, conds, IO_ALL);
+  let inR =applyConds(day.in_rows,  conds, IO_ALL);
+  if(DSORT.d!==0){ outR=[...outR].sort(cmpBy(DSORT.k,DSORT.d)); inR=[...inR].sort(cmpBy(DSORT.k,DSORT.d)); }
+  document.getElementById('n-out').textContent=outR.length;
+  document.getElementById('n-in').textContent=inR.length;
+  document.getElementById('io-hit').textContent=
+    conds.length? `출고 ${hitText(outR.length,day.out_rows.length)} · 입고 ${hitText(inR.length,day.in_rows.length)}` : '';
+
+  const S=(l,k,c)=>th(l,k,DSORT,'sortDay',c);
+  const empty=day.out_rows.length||day.in_rows.length?noHit():emptyMsg();
+  const out=!outR.length?empty:`<table><thead><tr><th>#</th>${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
+    outR.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
       <td class="qty">${fmt(r.qty)}</td><td>${esc(r.sales)}</td>
       <td>${esc(r.doc)||'—'}</td><td style="color:#888">${esc(r.remark)||''}</td></tr>`).join('')}</tbody></table>`;
-  const inn=!day.in_rows.length?emptyMsg():`<table><thead><tr><th>#</th><th>거래처/공급</th><th>PART#</th><th class="n">수량</th><th>담당</th><th>FAB</th><th>비고</th></tr></thead><tbody>${
-    day.in_rows.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
+  const inn=!inR.length?empty:`<table><thead><tr><th>#</th>${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}</tr></thead><tbody>${
+    inR.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
       <td class="qty">${fmt(r.qty)}</td><td>${esc(r.sales)}</td><td>${esc(r.fab)?'<span class="pill">FAB '+esc(r.fab)+'</span>':'—'}</td>
       <td style="color:#888">${esc(r.remark)||''}</td></tr>`).join('')}</tbody></table>`;
   TB={out,in:inn};
 }
+
+// 검색줄은 하루 보기와 기간 조회가 같이 쓴다 — 어느 쪽이 떠 있느냐에 따라 갈린다
+function applyIoSearch(){
+  if(LOGMODE) runLog();
+  else { buildTables(O.days[CUR]); showTab(TBcur); }
+}
+function clearIoSearch(){ clearFields('io'); applyIoSearch(); }
 function showTab(which){
   TBcur=which;
   document.getElementById('tb-out').classList.toggle('on',which==='out');
@@ -1971,10 +2064,66 @@ function showTab(which){
   document.getElementById('tablearea').innerHTML=TB[which]||'';
 }
 
+// ================= 칸 지정 검색 + 헤더 정렬 (표 3개 공용) =================
+// 검색은 [칸][값] AND [칸][값] 두 줄. '전체' 는 모든 칸을 훑는다.
+// 정렬은 헤더 클릭으로 오름 → 내림 → 기본 순환. 기간 조회만 서버가 정렬하는데,
+// 3,000행 상한이 걸린 뒤 화면에서 정렬하면 그 3,000행 안에서만 섞이기 때문이다.
+const F_IO =[['all','전체'],['customer','거래처'],['part','PART#'],
+             ['sales','담당'],['doc','문서번호'],['remark','비고']];
+const F_INV=[['all','전체'],['part','PART#'],['customer','PO# / 고객'],['buyer','발주업체'],
+             ['mobis','MOBIS ID'],['family','FAMILY'],['sales','담당'],['office','실']];
+
+function fillFields(prefix, fields, d1, d2){
+  const opt=f=>fields.map(([v,l])=>`<option value="${v}"${v===f?' selected':''}>${l}</option>`).join('');
+  document.getElementById(prefix+'-f1').innerHTML=opt(d1);
+  document.getElementById(prefix+'-f2').innerHTML=opt(d2);
+}
+function condsOf(prefix){
+  const out=[];
+  for(const n of ['1','2']){
+    const v=(document.getElementById(prefix+'-v'+n).value||'').trim();
+    if(v) out.push({f:document.getElementById(prefix+'-f'+n).value, v});
+  }
+  return out;
+}
+function clearFields(prefix){
+  document.getElementById(prefix+'-v1').value='';
+  document.getElementById(prefix+'-v2').value='';
+}
+// 한 조건 안의 띄어쓰기는 다시 AND. 칸이 'all' 이면 준 값들 전체를 훑는다.
+function condMatch(row, c, allOf){
+  const hay=(c.f==='all'? allOf(row) : [row[c.f]]).map(v=>String(v==null?'':v).toUpperCase());
+  return c.v.trim().split(/\s+/).every(t=>hay.some(h=>h.includes(t.toUpperCase())));
+}
+function applyConds(rows, conds, allOf){
+  return conds.length? rows.filter(r=>conds.every(c=>condMatch(r,c,allOf))) : rows;
+}
+
+const NUMCOL={qty:1,avail:1,booking:1,old:1};
+function cmpBy(k,d){
+  return (a,b)=>{
+    if(NUMCOL[k]) return ((Number(a[k])||0)-(Number(b[k])||0))*d;
+    return String(a[k]==null?'':a[k]).localeCompare(String(b[k]==null?'':b[k]),'ko',{numeric:true})*d;
+  };
+}
+function nextDir(st,key){
+  if(st.k!==key){ st.k=key; st.d=1; }
+  else if(st.d===1) st.d=-1;
+  else { st.k=''; st.d=0; }              // 세 번째 클릭 = 기본 정렬로 복귀
+}
+function th(label, key, st, fn, cls){
+  const on=st.k===key && st.d!==0;
+  return `<th class="s${on?' on':''}${cls?' '+cls:''}" onclick="${fn}('${key}')">`+
+         `${label}<span class="ar">${!on?'⇅':(st.d>0?'▲':'▼')}</span></th>`;
+}
+function hitText(shown, total){
+  return shown===total ? `${fmt(total)}건` : `${fmt(shown)}건 / 전체 ${fmt(total)}건`;
+}
+
 // ================= 기간 조회 (입출고 이력) =================
 // 실당 6만 행이라 브라우저로 다 못 내린다. 조건만 서버에 보내고 걸러진 것만 받는다.
 // 하루 보기(날짜 버튼)와 같은 표 자리를 쓰되, 하루짜리가 아닌 기간 집계를 보여준다.
-let LOGMODE=false, LOGRES=null, LOGARGS={from:'',to:'',q:''}, LOGTMR=null;
+let LOGMODE=false, LOGRES=null, LOGARGS={from:'',to:'',conds:[],sort:'date',dir:'desc'}, LOGTMR=null;
 
 const iso=d=>new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,10);
 function isoAdd(s,days){ const d=new Date(s+'T00:00:00'); d.setDate(d.getDate()+days); return iso(d); }
@@ -2006,19 +2155,25 @@ function logPreset(kind, quiet){
   if(!quiet) runLog();
 }
 
+let LSORT={k:'',d:0};                      // 기간 조회 정렬 (기본 = 일자 내림차순, 서버가 처리)
+function sortLog(key){ nextDir(LSORT,key); runLog(); }
+
 function runLog(){
   const from=document.getElementById('lg-from').value,
         to  =document.getElementById('lg-to').value,
-        q   =document.getElementById('lg-q').value.trim();
+        conds=condsOf('io');
   if(from && to && from>to){
     document.getElementById('tablearea').innerHTML=
       '<div style="padding:40px;text-align:center;color:var(--red);font-size:13px">시작일이 종료일보다 뒤입니다</div>';
     return;
   }
-  LOGARGS={from,to,q};
+  const sort=LSORT.d?LSORT.k:'date', dir=LSORT.d>0?'asc':'desc';
+  LOGARGS={from,to,conds,sort,dir};
   document.getElementById('tablearea').innerHTML=
     '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조회 중…</div>';
-  fetch(`/log?office=${encodeURIComponent(O.name)}&from=${from}&to=${to}&q=${encodeURIComponent(q)}`)
+  const p=new URLSearchParams({office:O.name, from, to, sort, dir});
+  conds.forEach((c,i)=>{ p.set('f'+(i+1),c.f); p.set('v'+(i+1),c.v); });
+  fetch('/log?'+p.toString())
     .then(r=>r.json()).then(res=>{
       if(res.error) throw new Error(res.error);
       LOGRES=res; LOGMODE=true; renderLog();
@@ -2029,7 +2184,8 @@ function runLog(){
 }
 
 function renderLog(){
-  const r=LOGRES, {from,to,q}=LOGARGS;
+  const r=LOGRES, {from,to,conds}=LOGARGS;
+  const q=conds.map(c=>`${(F_IO.find(f=>f[0]===c.f)||['','전체'])[1]}='${c.v}'`).join(' AND ');
   document.querySelectorAll('#dayseg button').forEach(b=>b.classList.remove('on'));
   document.getElementById('lg-off').style.display='';
   document.getElementById('hl').style.display='none';
@@ -2049,20 +2205,20 @@ function renderLog(){
 
   document.getElementById('n-out').textContent=r.out.cnt;
   document.getElementById('n-in').textContent=r.in.cnt;
+  document.getElementById('io-hit').textContent=`출고 ${fmt(r.out.cnt)}건 · 입고 ${fmt(r.in.cnt)}건`;
 
   const none=`<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조건에 맞는 내역이 없습니다</div>`;
-  const cap=s=>s.truncated?`<div class="trunc">전체 ${fmt(s.cnt)}건 중 최근 ${fmt(s.shown)}건만 표시합니다 —
-    기간을 좁히거나 검색어를 넣어 보세요. <b>⬇ Excel 내보내기는 전체가 나갑니다.</b></div>`:'';
+  const cap=s=>s.truncated?`<div class="trunc">전체 ${fmt(s.cnt)}건 중 ${fmt(s.shown)}건만 표시합니다 —
+    기간을 좁히거나 검색 조건을 넣어 보세요. <b>⬇ Excel 내보내기는 전체가 나갑니다.</b></div>`:'';
+  const S=(l,k,c)=>th(l,k,LSORT,'sortLog',c);
 
   TB={
-    out: !r.out.rows.length?none:cap(r.out)+`<table><thead><tr><th>#</th><th>일자</th><th>거래처</th><th>PART#</th>
-      <th class="n">수량</th><th>담당</th><th>문서번호</th><th>비고</th></tr></thead><tbody>${
+    out: !r.out.rows.length?none:cap(r.out)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
       r.out.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
         <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
         <td class="qty">${fmt(x.qty)}</td><td>${esc(x.sales)}</td>
         <td>${esc(x.doc)||'—'}</td><td style="color:#888">${esc(x.remark)||''}</td></tr>`).join('')}</tbody></table>`,
-    in: !r.in.rows.length?none:cap(r.in)+`<table><thead><tr><th>#</th><th>일자</th><th>거래처/공급</th><th>PART#</th>
-      <th class="n">수량</th><th>담당</th><th>FAB</th><th>비고</th></tr></thead><tbody>${
+    in: !r.in.rows.length?none:cap(r.in)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}</tr></thead><tbody>${
       r.in.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
         <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
         <td class="qty">${fmt(x.qty)}</td><td>${esc(x.sales)}</td>
@@ -2080,18 +2236,32 @@ function exitLogUI(){
   const g1=document.getElementById('iogrid1'), g2=document.getElementById('iogrid2');
   if(g1) g1.style.display=''; if(g2) g2.style.display='';
 }
-function exitLog(){
-  document.getElementById('lg-q').value='';
-  showDay(CUR);
-}
+function exitLog(){ LSORT={k:'',d:0}; showDay(CUR); }
 
-// 검색은 타이핑이 멎으면 자동 조회 — 재고 현황 검색창과 같은 감각으로 맞췄다
 document.addEventListener('DOMContentLoaded',()=>{
-  const q=document.getElementById('lg-q');
-  if(q){
-    q.addEventListener('input',()=>{ clearTimeout(LOGTMR); LOGTMR=setTimeout(runLog,350); });
-    q.addEventListener('keydown',e=>{ if(e.key==='Enter'){ clearTimeout(LOGTMR); runLog(); } });
-  }
+  fillFields('io', F_IO, 'all', 'part');
+  fillFields('inv', F_INV, 'all', 'part');
+  // 타이핑이 멎으면 자동 조회 — 조회 버튼을 누르지 않아도 되게
+  ['io-v1','io-v2'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(!el) return;
+    el.addEventListener('input',()=>{ clearTimeout(LOGTMR); LOGTMR=setTimeout(applyIoSearch,350); });
+    el.addEventListener('keydown',e=>{ if(e.key==='Enter'){ clearTimeout(LOGTMR); applyIoSearch(); } });
+  });
+  ['io-f1','io-f2'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('change',applyIoSearch);
+  });
+  ['inv-v1','inv-v2'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(!el) return;
+    el.addEventListener('input',()=>{ clearTimeout(LOGTMR); LOGTMR=setTimeout(drawInvTable,250); });
+    el.addEventListener('keydown',e=>{ if(e.key==='Enter'){ clearTimeout(LOGTMR); drawInvTable(); } });
+  });
+  ['inv-f1','inv-f2'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('change',drawInvTable);
+  });
   ['lg-from','lg-to'].forEach(id=>{
     const el=document.getElementById(id);
     if(el) el.addEventListener('change',()=>{
@@ -2302,7 +2472,6 @@ function renderInventory(){
   document.getElementById('ib-old').style.display=hasDC?'':'none';
   document.getElementById('in-bk').textContent=I.items.filter(x=>x.booking>0).length;
   if(!hasDC && ITAB==='old') ITAB='all';
-  document.getElementById('invq').oninput=()=>drawInvTable();
   showInvTab('all');
 }
 
@@ -2312,27 +2481,35 @@ function showInvTab(t){
   drawInvTable();
 }
 
+let ISORT={k:'',d:0};                      // 재고 정렬 (기본 = 재고 수량 내림차순)
+function sortInv(key){ nextDir(ISORT,key); drawInvTable(); }
+function clearInvSearch(){ clearFields('inv'); drawInvTable(); }
+
+// '발주업체' 로 검색하려면 조인 결과가 행에 있어야 한다 — 필터 직전에 붙여 둔다
+const INV_ALL=x=>[x.part,x.mobis,x.family,x.sales,x.customer,x.pn,x.office,x.buyer];
+
 function drawInvTable(){
   const I=INVS[INVK];
   if(!I) return;
-  const q=(document.getElementById('invq').value||'').trim().toUpperCase();
-  let rows=I.items;
-  if(ITAB==='old') rows=rows.filter(x=>x.old>0);
-  if(ITAB==='bk')  rows=rows.filter(x=>x.booking>0);
-  if(q) rows=rows.filter(x=>[x.part,x.mobis,x.family,x.sales,x.customer,x.pn,buyerOf(x)]
-      .some(v=>String(v||'').toUpperCase().includes(q)));
-  rows=[...rows].sort((a,b)=>b.qty-a.qty);
+  let base=I.items.map(x=>({...x, buyer:buyerOf(x)}));
+  if(ITAB==='old') base=base.filter(x=>x.old>0);
+  if(ITAB==='bk')  base=base.filter(x=>x.booking>0);
+  const conds=condsOf('inv');
+  let rows=applyConds(base, conds, INV_ALL);
+  document.getElementById('inv-hit').textContent=conds.length?hitText(rows.length,base.length):'';
+  rows=[...rows].sort(ISORT.d?cmpBy(ISORT.k,ISORT.d):(a,b)=>b.qty-a.qty);
 
   const el=document.getElementById('invtable');
-  if(!rows.length){ el.innerHTML=emptyMsg(); return; }
+  if(!rows.length){ el.innerHTML=base.length?noHit():emptyMsg(); return; }
   // 장기재고/Datecode 칼럼은 데이터가 있는 실에서만 (영업1,2실)
   const dc=I.datecode.some(d=>d.qty>0);
   // 발주업체 칼럼은 선적 리포트를 올렸고 실제로 붙는 게 있을 때만 (영업1,2실은 전부 빈칸이라 뺀다)
-  const hasBuyer=POROWS>0 && rows.some(x=>buyerOf(x));
-  el.innerHTML=`<table><thead><tr><th>#</th><th>PART#</th><th>${poHeader(I.items)}</th>${hasBuyer?'<th>발주업체</th>':''}
-    <th>MOBIS ID</th><th>FAMILY</th>
-    <th>실</th><th class="n">재고</th><th class="n">가용</th><th class="n">예약</th>
-    ${dc?'<th class="n">장기재고</th><th>Datecode</th>':''}<th>담당</th></tr></thead><tbody>${
+  const hasBuyer=POROWS>0 && base.some(x=>x.buyer);
+  const S=(l,k,c)=>th(l,k,ISORT,'sortInv',c);
+  el.innerHTML=`<table><thead><tr><th>#</th>${S('PART#','part')}${S(poHeader(I.items),'customer')}${hasBuyer?S('발주업체','buyer'):''}
+    ${S('MOBIS ID','mobis')}${S('FAMILY','family')}
+    ${S('실','office')}${S('재고','qty','n')}${S('가용','avail','n')}${S('예약','booking','n')}
+    ${dc?S('장기재고','old','n')+S('Datecode','oldest'):''}${S('담당','sales')}</tr></thead><tbody>${
     rows.map((x,i)=>`<tr class="${dc&&x.old>0?'oldrow':''}">
       <td class="n">${i+1}</td>
       <td class="part">${esc(x.part)}</td>
