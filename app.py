@@ -266,6 +266,20 @@ def log_conn():
         office TEXT, dir TEXT, date TEXT, customer TEXT, part TEXT, qty REAL,
         sales TEXT, doc TEXT, mcode TEXT, remark TEXT, fab TEXT)""")
     cx.execute("CREATE INDEX IF NOT EXISTS ix_log ON log(office, dir, date)")
+    # 선적 리포트(PO# → 발주업체). 주간 파일을 올릴 때마다 누적된다.
+    # 같은 운송장·PO·파트·SO 로 수량만 다른 분할 선적이 실제로 있어서 qty 까지 키에 넣는다 —
+    # 안 그러면 3,000EA 와 750EA 중 하나가 조용히 사라진다.
+    SHIP_DDL = ("CREATE TABLE ship(po TEXT, npo TEXT, part TEXT, customer TEXT, "
+                "sales TEXT, qty REAL, so TEXT, ww TEXT, year TEXT, tracking TEXT, "
+                "UNIQUE(tracking, po, part, so, qty))")
+    old = cx.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='ship'").fetchone()
+    if old and "qty)" not in (old[0] or "").split("UNIQUE(")[-1]:
+        cx.execute("DROP TABLE ship")                    # 옛 키로 만든 표는 버리고 다시 올린다
+        old = None
+    if not old:
+        cx.execute(SHIP_DDL)
+    cx.execute("CREATE INDEX IF NOT EXISTS ix_ship_po ON ship(po)")
+    cx.execute("CREATE INDEX IF NOT EXISTS ix_ship_npo ON ship(npo)")
     return cx
 
 
@@ -350,6 +364,109 @@ def log_span(office=None):
     finally:
         cx.close()
     return dict(min=row[0] or "", max=row[1] or "", rows=row[2] or 0)
+
+
+# ---------------------------------------------------------------- 선적 리포트 (PO# → 발주업체)
+# 재고 시트의 'CUSTOMER' 컬럼에는 고객명이 아니라 PO#(26DIT0213N10 꼴)가 들어 있다.
+# 선적 리포트의 'PO Number' 가 같은 값이라 이걸로 조인하면 진짜 발주업체명이 붙는다.
+# (요청받은 '발주업체+파트' 조인은 두 파일의 거래처 표기가 달라 실측 0건이었다.)
+
+
+def norm_po(s):
+    """분할 발주 꼬리표를 뗀다: 26YS0211N4-5-5 → 26YS0211N4. 정확 일치가 실패할 때만 쓴다."""
+    return re.sub(r"-\d+(-\d+)*$", "", clean(s)).upper()
+
+
+def shipping_sheet(wb):
+    """선적 리포트 시트를 찾는다. 시트명이 매주 바뀌므로(ShipRpt_..._2) 헤더로 판별한다."""
+    for s in wb.sheetnames:
+        for r in wb[s].iter_rows(min_row=1, max_row=6, values_only=True):
+            if r and {"PONUMBER", "PARTNUMBER"} <= {_hkey(c) for c in r if clean(c)}:
+                return wb[s]
+    return None
+
+
+def parse_shipping(ws):
+    """선적 리포트 → [{po, part, customer, sales, qty, so, ww, year, tracking}]."""
+    cols, out = {}, []
+    for r in ws.iter_rows(values_only=True):
+        if not r:
+            continue
+        keys = {_hkey(c) for c in r if clean(c)}
+        if {"PONUMBER", "PARTNUMBER"} <= keys:            # 헤더행
+            cols = {_hkey(h): i for i, h in enumerate(r) if clean(h)}
+            continue
+        if not cols:
+            continue
+
+        def col(*names):
+            for n in names:
+                i = cols.get(n)
+                if i is not None and i < len(r):
+                    v = clean(r[i])
+                    if v:
+                        return v
+            return ""
+
+        po, part = col("PONUMBER"), col("PARTNUMBER")
+        if not po or not part:
+            continue
+        out.append(dict(
+            po=po, part=part, customer=col("CUSTOMER"),
+            sales=col("SALES", "담당SALES"), qty=to_num(
+                r[cols["TOTALQTY"]] if cols.get("TOTALQTY") is not None
+                and cols["TOTALQTY"] < len(r) else 0),
+            so=col("SO#", "ORDERNUMBER"), ww=col("선적WW", "WW"), year=col("연도", "YEAR"),
+            tracking=col("TRACKINGNUMBER"),
+        ))
+    return out
+
+
+def ship_store(rows):
+    """선적 행을 누적한다. 같은 선적 라인(운송장+PO+파트+SO)을 다시 올려도 늘어나지 않는다."""
+    cx = log_conn()
+    try:
+        cx.executemany(
+            "INSERT OR REPLACE INTO ship VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(r["po"], norm_po(r["po"]), r["part"], r["customer"], r["sales"],
+              r["qty"], r["so"], r["ww"], r["year"], r["tracking"]) for r in rows])
+        cx.commit()
+    finally:
+        cx.close()
+
+
+def po_map():
+    """PO# → [발주업체]. 정확 일치용과 꼬리표 제거용 두 벌.
+
+    한 PO#가 두 업체로 선적된 경우가 실제로 있다(26DIT0213N10 → 동일기연 WW15,
+    연승일레콤 WW25). 임의로 하나를 고르면 조용히 틀린 회사를 보여주게 되므로
+    선적 수량 큰 순서로 전부 담고, 화면에서 '외 N' 으로 알린다.
+    """
+    cx = log_conn()
+    try:
+        exact, loose = defaultdict(list), defaultdict(list)
+        for key, col in (("po", exact), ("npo", loose)):
+            for k, cust, _ in cx.execute(
+                    f"SELECT {key}, customer, SUM(qty) q FROM ship "
+                    f"WHERE customer<>'' GROUP BY {key}, customer ORDER BY q DESC"):
+                col[k.upper()].append(cust)
+        n = cx.execute("SELECT COUNT(*) FROM ship").fetchone()[0]
+    finally:
+        cx.close()
+    return dict(exact=dict(exact), loose=dict(loose), rows=n)
+
+
+def po_lookup(pos, pm=None):
+    """재고의 PO# 목록 → {PO#: [발주업체]}. 정확 일치 우선, 없으면 꼬리표 떼고 한 번 더."""
+    pm = pm or po_map()
+    out = {}
+    for p in pos:
+        if not p:
+            continue
+        c = pm["exact"].get(clean(p).upper()) or pm["loose"].get(norm_po(p))
+        if c:
+            out[p] = c
+    return out
 
 
 # ---------------------------------------------------------------- 재고 현황
@@ -613,6 +730,7 @@ def build_payload(files, password):
     """
     raw_offices, inventories = [], {}     # [(실이름, {날짜:(inb,outb)})]
     logs = {}                             # 실이름 → {'in': [...], 'out': [...]} 누적 이력
+    ships = []                            # 선적 리포트 행 (PO# → 발주업체)
     for f in files:
         name = f.get("name") or "실"
         wb = open_wb(decode_upload(f["file"]), password)
@@ -628,12 +746,19 @@ def build_payload(files, password):
                 inv = parse_inventory(ws)
                 if inv:
                     inventories[name] = inv
+                    continue
+            ws = shipping_sheet(wb)                     # 선적 리포트 (PO# → 발주업체)
+            if ws is not None:
+                ships.extend(parse_shipping(ws))
         finally:
             wb.close()
 
-    if not raw_offices and not inventories:
-        raise ValueError("날짜 시트(YYYY-MM-DD)가 있는 입출고 파일이나 "
-                         "'inventory' 시트가 있는 재고 파일을 찾지 못했습니다.")
+    if ships:
+        ship_store(ships)
+
+    if not raw_offices and not inventories and not ships:
+        raise ValueError("날짜 시트(YYYY-MM-DD)가 있는 입출고 파일, 'inventory' 시트가 있는 "
+                         "재고 파일, 'PO Number' 가 있는 선적 리포트 중 아무것도 찾지 못했습니다.")
 
     # ---- 거래처 표기 통일 (Mobis / MOBIS → 가장 많이 쓰인 표기 하나로) ----
     # 파일 전체를 본 뒤에야 대표 표기를 고를 수 있어 여기서 일괄 처리한다.
@@ -747,15 +872,18 @@ def export_xlsx(payload):
                ["당월 입고", inv["month"]["inbound"]],
                ["당월 출고", inv["month"]["outbound"]]],
               widths=[26, 16])
+        # 재고의 'CUSTOMER' 칸은 실제로 PO# 다. 헤더를 바로잡고, 선적 리포트로
+        # 찾아낸 발주업체를 옆에 붙인다 (리포트를 안 올렸으면 빈 칸으로 나간다).
+        buyers = po_lookup([i.get("customer") for i in inv["items"]])
         sheet("품목", f"품목별 재고 · {office}",
-              ["PART#", "MOBIS ID", "FAMILY", "VENDER", "실", "담당", "고객",
+              ["PART#", "PO# / 고객", "발주업체", "MOBIS ID", "FAMILY", "VENDER", "실", "담당",
                "재고", "가용", "예약", "장기재고", "Datecode"],
-              [[i["part"], i["mobis"], i["family"], i["vender"], i["office"],
-                i["sales"], i["customer"], i["qty"], i["avail"], i["booking"],
-                i["old"], i["oldest"] or ""] for i in
+              [[i["part"], i["customer"], " / ".join(buyers.get(i["customer"], [])),
+                i["mobis"], i["family"], i["vender"], i["office"], i["sales"],
+                i["qty"], i["avail"], i["booking"], i["old"], i["oldest"] or ""] for i in
                sorted(inv["items"], key=lambda x: -x["qty"])],
-              widths=[26, 16, 16, 12, 10, 10, 18, 12, 12, 12, 12, 11],
-              red_col=11)
+              widths=[26, 18, 24, 16, 16, 12, 10, 10, 12, 12, 12, 12, 11],
+              red_col=12)
         # Datecode 는 영업1,2실에만 채워져 있다 → 있는 실에서만 시트를 만든다
         dc = [d for d in inv["datecode"] if d["qty"] > 0]
         if dc:
@@ -1167,6 +1295,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, f.read())
             else:
                 self._send(200, json.dumps({"offices": []}))
+        elif path == "/po":                              # PO# → 발주업체 (선적 리포트 누적분)
+            pm = po_map()
+            self._send(200, json.dumps(
+                {"map": pm["exact"], "loose": pm["loose"], "rows": pm["rows"]},
+                ensure_ascii=False))
         elif path == "/log":                             # 기간 조회 (입출고 이력)
             q = urllib.parse.parse_qs(self.path.partition("?")[2])
             g = lambda k: (q.get(k) or [""])[0].strip()   # noqa: E731
@@ -1187,11 +1320,21 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/build":
                 files = payload.get("files") or [{"name": "", "file": payload["file"]}]
                 result = build_payload(files, payload.get("password") or DEFAULT_PW)
-                try:                                     # 업로드 결과 저장 → 링크 연 사람 모두 공유
-                    with open(DATA_FILE, "w", encoding="utf-8") as f:
-                        json.dump(result, f, ensure_ascii=False)
-                except Exception:
-                    pass
+                # 선적 리포트만 올린 경우 offices/inventories 가 비어 있다. 그대로 저장하면
+                # 대시보드가 통째로 지워지므로, 그때는 저장돼 있던 것을 그대로 살린다.
+                if not result["offices"] and not result["inventories"]:
+                    try:
+                        with open(DATA_FILE, encoding="utf-8") as f:
+                            prev = json.load(f)
+                        result = {**prev, "ship_only": True}
+                    except Exception:
+                        pass
+                else:
+                    try:                                 # 업로드 결과 저장 → 링크 연 사람 모두 공유
+                        with open(DATA_FILE, "w", encoding="utf-8") as f:
+                            json.dump(result, f, ensure_ascii=False)
+                    except Exception:
+                        pass
                 # 발송은 여기서 끝낸다. 업로더가 탭을 닫아도 메일은 나간다.
                 origin = payload.get("origin") or f"http://{self.headers.get('Host', 'localhost')}"
                 result["mail"] = send_office_emails(result, origin)
@@ -1372,6 +1515,7 @@ tbody td{padding:10px 14px;border-bottom:1px solid var(--line);}
 tbody tr:hover{background:#fbfafc;}
 td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;}
 td.part{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;}
+td.po{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:#555;white-space:nowrap;}
 td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
 .pill{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:6px;background:#eef2f7;color:var(--blue);}
 .pill.o{background:#fbe9e9;color:var(--red);}
@@ -1609,7 +1753,8 @@ function renderApp(){
   document.getElementById('vw-io').style.display=hasIO?'':'none';
   document.getElementById('vw-inv').style.display=hasInv?'':'none';
 
-  if(hasInv){ INVK=INVNAMES[0]; renderInventory(); }
+  // 발주업체 표를 먼저 받아 두고 재고를 그린다 (없으면 PO# 칼럼만 나오고 그대로 동작)
+  if(hasInv){ INVK=INVNAMES[0]; loadPoMap().then(renderInventory); }
   showView(hasIO?'io':(hasInv?'inv':'io'));
 }
 
@@ -1958,6 +2103,40 @@ document.addEventListener('DOMContentLoaded',()=>{
 
 // ================= 재고 현황 =================
 let ICH={}, ITAB='all';
+
+// PO# → 발주업체. 재고 시트의 CUSTOMER 칸은 고객명이 아니라 PO# 라서,
+// 선적 리포트에서 받아온 이 표로 진짜 발주업체를 붙인다.
+// 서버에서 따로 받는 이유: 재고와 선적 리포트를 다른 날 올려도 항상 최신으로 맞추기 위해서다.
+let POMAP={}, POLOOSE={}, POROWS=0;
+const normPo=s=>String(s||'').replace(/-\d+(-\d+)*$/,'').toUpperCase();   // 26YS0211N4-5-5 → 26YS0211N4
+const POLIKE=/^\d{2}[A-Z]{2,6}\d{3,4}[A-Z]?\d*(-\d+)*$/i;                // 26DIT0213N10 꼴
+
+// 한 PO#가 두 업체로 선적된 경우가 있어 배열로 온다. 첫째만 쓰고 나머지는 '외 N' 으로 알린다.
+function buyersOf(x){
+  const p=String(x.customer||'').toUpperCase();
+  return POMAP[p] || POLOOSE[normPo(x.customer)] || [];
+}
+function buyerOf(x){ return (buyersOf(x)[0])||''; }
+function buyerCell(x){
+  const b=buyersOf(x);
+  if(!b.length) return '<span style="color:#c8c8d0">—</span>';
+  return esc(b[0])+(b.length>1?` <span class="pill" title="${esc(b.slice(1).join(', '))}">외 ${b.length-1}</span>`:'');
+}
+
+// CUSTOMER 칸의 의미가 실마다 다르다. 영업5실은 PO#(69%)와 고객명이 섞여 있고,
+// 영업1,2실·4실은 거의 고객명이다. 한쪽으로 확실할 때만 그 이름을 쓰고,
+// 섞여 있으면 섞였다고 적는다 — 'PO#' 로 단정하면 나머지 행에서 거짓말이 된다.
+function poHeader(items){
+  const v=items.map(x=>x.customer).filter(Boolean);
+  if(!v.length) return 'PO# / 고객';
+  const r=v.filter(s=>POLIKE.test(s)).length/v.length;
+  return r>=0.9 ? 'PO#' : (r<=0.1 ? '고객' : 'PO# / 고객');
+}
+function loadPoMap(){
+  return fetch('/po').then(r=>r.json()).then(d=>{
+    POMAP=d.map||{}; POLOOSE=d.loose||{}; POROWS=d.rows||0;
+  }).catch(()=>{});
+}
 const pct=(a,b)=>b?Math.round(a/b*1000)/10:0;
 
 // 볼 수 있는 실만 연다 (실 페이지에서는 자기 실뿐 — 차트 드릴다운으로도 못 넘어간다)
@@ -2140,7 +2319,7 @@ function drawInvTable(){
   let rows=I.items;
   if(ITAB==='old') rows=rows.filter(x=>x.old>0);
   if(ITAB==='bk')  rows=rows.filter(x=>x.booking>0);
-  if(q) rows=rows.filter(x=>[x.part,x.mobis,x.family,x.sales,x.customer,x.pn]
+  if(q) rows=rows.filter(x=>[x.part,x.mobis,x.family,x.sales,x.customer,x.pn,buyerOf(x)]
       .some(v=>String(v||'').toUpperCase().includes(q)));
   rows=[...rows].sort((a,b)=>b.qty-a.qty);
 
@@ -2148,12 +2327,17 @@ function drawInvTable(){
   if(!rows.length){ el.innerHTML=emptyMsg(); return; }
   // 장기재고/Datecode 칼럼은 데이터가 있는 실에서만 (영업1,2실)
   const dc=I.datecode.some(d=>d.qty>0);
-  el.innerHTML=`<table><thead><tr><th>#</th><th>PART#</th><th>MOBIS ID</th><th>FAMILY</th>
+  // 발주업체 칼럼은 선적 리포트를 올렸고 실제로 붙는 게 있을 때만 (영업1,2실은 전부 빈칸이라 뺀다)
+  const hasBuyer=POROWS>0 && rows.some(x=>buyerOf(x));
+  el.innerHTML=`<table><thead><tr><th>#</th><th>PART#</th><th>${poHeader(I.items)}</th>${hasBuyer?'<th>발주업체</th>':''}
+    <th>MOBIS ID</th><th>FAMILY</th>
     <th>실</th><th class="n">재고</th><th class="n">가용</th><th class="n">예약</th>
     ${dc?'<th class="n">장기재고</th><th>Datecode</th>':''}<th>담당</th></tr></thead><tbody>${
     rows.map((x,i)=>`<tr class="${dc&&x.old>0?'oldrow':''}">
       <td class="n">${i+1}</td>
       <td class="part">${esc(x.part)}</td>
+      <td class="po">${esc(x.customer)||'—'}</td>
+      ${hasBuyer?`<td>${buyerCell(x)}</td>`:''}
       <td>${esc(x.mobis)||'—'}</td>
       <td>${esc(x.family)||'—'}</td>
       <td>${esc(x.office)||'—'}</td>
