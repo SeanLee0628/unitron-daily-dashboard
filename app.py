@@ -2,20 +2,26 @@
 # -*- coding: utf-8 -*-
 """일일 입출고 리포트 대시보드 (업로드형).
 
-암호화된 'daily material shipping & receiving' 엑셀을 업로드하면 → 날짜 시트
-(어제·오늘)만 읽어 → 일일 입출고 리포트 대시보드. 입고/출고 마스터 시트는 안 씀.
+암호화된 'daily material shipping & receiving' 엑셀을 업로드하면 → 일일 입출고 대시보드.
+
+  하루 보기  : 날짜 시트(YYYY-MM-DD, 어제·오늘) → KPI·차트·표
+  기간 조회  : 누적 '입고'/'출고' 시트(2019~) → SQLite 에 적재하고 기간·검색으로 조회
+  재고 현황  : '~ inventory' 시트
 
 표준 라이브러리만 사용. 엑셀은 브라우저에서 base64로 전송한다.
 """
 from __future__ import annotations
 
 import base64
+import datetime
 import io
 import json
 import os
 import re
 import socket
+import sqlite3
 import threading
+import urllib.parse
 import webbrowser
 from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +38,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PW = os.environ.get("XLSX_PW", "")
 CHART_JS = os.path.join(HERE, "chart.umd.min.js")
 DATA_FILE = os.path.join(os.environ.get("DATA_DIR", HERE), "saved_data.json")  # 데이터 저장(공유)
+LOG_DB = os.path.join(os.environ.get("DATA_DIR", HERE), "log.db")             # 입출고 이력(기간 조회)
 
 
 def clean(x):
@@ -172,6 +179,177 @@ def parse_workbook(wb):
         if re.match(r"\d{4}-\d{2}-\d{2}", s):
             per[s] = parse_daily(wb[s])
     return per
+
+
+# ---------------------------------------------------------------- 입출고 이력 (기간 조회)
+# 날짜 시트(YYYY-MM-DD)는 오늘·어제만 남기는 롤링 구조라 기간 조회에 못 쓴다.
+# 같은 워크북의 '입고'/'출고' 누적 시트에 2019년부터의 전 이력이 그대로 쌓여 있다 —
+# 실당 6만 행이라 브라우저로 통째 내려보낼 수 없어서 SQLite 에 넣고 서버가 걸러 준다.
+LOG_DIRS = {"in": ("입고", "INBOUND"), "out": ("출고", "OUTBOUND")}
+LOG_MAX_ROWS = 3000              # 화면에 한 번에 내려보낼 행 상한 (집계는 전체 기준으로 낸다)
+
+
+def norm_date(v):
+    """엑셀 DATE 셀 → 'YYYY-MM-DD'. 못 읽으면 빈 문자열."""
+    if isinstance(v, datetime.datetime):
+        return v.strftime("%Y-%m-%d")
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    m = re.match(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", clean(v))
+    return "%04d-%02d-%02d" % tuple(int(x) for x in m.groups()) if m else ""
+
+
+def log_sheets(wb):
+    """누적 '입고'/'출고' 시트 이름 → {'in': 시트명, 'out': 시트명}. 날짜 시트는 뺀다."""
+    found = {}
+    for s in wb.sheetnames:
+        if re.match(r"\d{4}-\d{2}-\d{2}", s):
+            continue
+        k = clean(s).upper().replace(" ", "")
+        for d, names in LOG_DIRS.items():
+            if d not in found and any(n in k for n in names):
+                found[d] = s
+    return found
+
+
+def parse_log(ws):
+    """누적 시트 1개 → [{date, part, qty, customer, sales, doc, mcode, remark, fab}].
+
+    parse_daily 와 같은 헤더 동적 인식이되 DATE 를 함께 읽는다 — 날짜 시트는
+    시트 이름이 곧 날짜였지만 여기서는 행마다 날짜가 다르다.
+    """
+    cols, rows = {}, []
+    for r in ws.iter_rows(values_only=True):
+        if not r:
+            continue
+        c0 = clean(r[0])
+        if c0 == "NO":                              # 헤더행 → 컬럼 위치 매핑
+            cols = {_hkey(h): i for i, h in enumerate(r) if clean(h)}
+            continue
+        if not cols or not c0 or not c0.isdigit():
+            continue
+
+        def raw(*keys):
+            for k in keys:
+                i = cols.get(k)
+                if i is not None and i < len(r):
+                    return r[i]
+            return None
+
+        def col(*keys):
+            for k in keys:
+                i = cols.get(k)
+                if i is not None and i < len(r):
+                    v = clean(r[i])
+                    if v:
+                        return v
+            return ""
+
+        part = col("PART#", "PART", "MPN")
+        date = norm_date(raw("DATE", "일자"))
+        if not part or not date:                    # 날짜 없는 행은 기간 조회에 못 쓴다
+            continue
+        rows.append(dict(
+            date=date, part=part, qty=to_num(raw("QTY", "QUANTITY")),
+            # 입고는 공급처가 CUSTOMER 대신 SR# 칸에 적힌 행이 많다 (parse_daily 와 같은 폴백)
+            customer=col("CUSTOMER", "SR#", "공급처"),
+            sales=norm_sales(col("담당SALES", "SALES")),
+            doc=col("SR#", "문서번호", "DOC"), mcode=col("MATERIALCODE"),
+            remark=col("REMARK"), fab=col("FAB"),
+        ))
+    return rows
+
+
+def log_conn():
+    cx = sqlite3.connect(LOG_DB, timeout=30)
+    cx.execute("""CREATE TABLE IF NOT EXISTS log(
+        office TEXT, dir TEXT, date TEXT, customer TEXT, part TEXT, qty REAL,
+        sales TEXT, doc TEXT, mcode TEXT, remark TEXT, fab TEXT)""")
+    cx.execute("CREATE INDEX IF NOT EXISTS ix_log ON log(office, dir, date)")
+    return cx
+
+
+def log_store(office, by_dir):
+    """실 1개의 이력을 통째로 갈아끼운다 — 재업로드하면 그 파일이 기준이 된다.
+    업로드하지 않은 실의 이력은 건드리지 않는다."""
+    cx = log_conn()
+    try:
+        cx.execute("DELETE FROM log WHERE office=?", (office,))
+        cx.executemany("INSERT INTO log VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                       [(office, d, r["date"], r["customer"], r["part"], r["qty"],
+                         r["sales"], r["doc"], r["mcode"], r["remark"], r["fab"])
+                        for d, rows in by_dir.items() for r in rows])
+        cx.commit()
+    finally:
+        cx.close()
+
+
+def log_prune(keep):
+    """이번 업로드에 없는 실의 이력은 버린다 (실 이름이 바뀌면 옛 행이 유령으로 남는다)."""
+    cx = log_conn()
+    try:
+        cx.execute("DELETE FROM log WHERE office NOT IN (%s)"
+                   % ",".join("?" * len(keep)), keep)
+        cx.commit()
+        cx.execute("VACUUM")
+    finally:
+        cx.close()
+
+
+def _log_where(office, dfrom, dto, q):
+    """조회 조건 → (SQL 조각, 인자). 검색어는 공백으로 나눠 전부 포함(AND)."""
+    where, args = [], []
+    if office and office != ALL:                    # 전체 합계 = 실 구분 없이 전부
+        where.append("office=?"); args.append(office)
+    if dfrom:
+        where.append("date>=?"); args.append(dfrom)
+    if dto:
+        where.append("date<=?"); args.append(dto)
+    for term in (q or "").split():
+        like = f"%{term}%"
+        where.append("(customer LIKE ? OR part LIKE ? OR sales LIKE ? OR doc LIKE ? "
+                     "OR mcode LIKE ? OR remark LIKE ?)")
+        args += [like] * 6
+    return (" AND ".join(where) or "1=1"), args
+
+
+def log_query(office, dfrom, dto, q, limit=LOG_MAX_ROWS):
+    """기간+검색으로 입고/출고를 각각 집계하고 행을 돌려준다.
+    건수·수량은 상한과 무관하게 조건에 맞는 전체 기준이다."""
+    sql, args = _log_where(office, dfrom, dto, q)
+    out = {}
+    cx = log_conn()
+    try:
+        for d in ("out", "in"):
+            cnt, qty, custs = cx.execute(
+                f"SELECT COUNT(*),COALESCE(SUM(qty),0),COUNT(DISTINCT customer) "
+                f"FROM log WHERE dir=? AND {sql}", [d] + args).fetchone()
+            rows = [dict(date=a, customer=b, part=c, qty=round(e), sales=f,
+                         doc=g, mcode=h, remark=i, fab=j)
+                    for a, b, c, e, f, g, h, i, j in cx.execute(
+                        f"SELECT date,customer,part,qty,sales,doc,mcode,remark,fab "
+                        f"FROM log WHERE dir=? AND {sql} ORDER BY date DESC, rowid DESC "
+                        f"LIMIT ?", [d] + args + [limit])]
+            out[d] = dict(cnt=cnt, qty=round(qty), customers=custs,
+                          rows=rows, shown=len(rows), truncated=cnt > len(rows))
+    finally:
+        cx.close()
+    out["net"] = out["in"]["qty"] - out["out"]["qty"]
+    return out
+
+
+def log_span(office=None):
+    """그 실의 이력이 언제부터 언제까지 있는지 — 달력 입력의 범위로 쓴다."""
+    cx = log_conn()
+    try:
+        if office and office != ALL:
+            row = cx.execute("SELECT MIN(date),MAX(date),COUNT(*) FROM log "
+                             "WHERE office=?", (office,)).fetchone()
+        else:
+            row = cx.execute("SELECT MIN(date),MAX(date),COUNT(*) FROM log").fetchone()
+    finally:
+        cx.close()
+    return dict(min=row[0] or "", max=row[1] or "", rows=row[2] or 0)
 
 
 # ---------------------------------------------------------------- 재고 현황
@@ -434,6 +612,7 @@ def build_payload(files, password):
     재고도 실별로 보관한다. (전에는 하나만 남아 마지막 파일이 앞의 것을 덮어썼다)
     """
     raw_offices, inventories = [], {}     # [(실이름, {날짜:(inb,outb)})]
+    logs = {}                             # 실이름 → {'in': [...], 'out': [...]} 누적 이력
     for f in files:
         name = f.get("name") or "실"
         wb = open_wb(decode_upload(f["file"]), password)
@@ -441,6 +620,8 @@ def build_payload(files, password):
             per = parse_workbook(wb)
             if per:                                     # 입출고 파일
                 raw_offices.append((name, per))
+                # 같은 파일의 누적 시트 = 기간 조회용 이력 (날짜 시트는 2일치뿐이라)
+                logs[name] = {d: parse_log(wb[s]) for d, s in log_sheets(wb).items()}
                 continue
             ws = inventory_sheet(wb)                    # 재고 파일
             if ws is not None:
@@ -461,6 +642,10 @@ def build_payload(files, password):
         for inb, outb in per.values():
             for r in inb + outb:
                 C.add(r.get("customer"))
+    for by_dir in logs.values():
+        for rows in by_dir.values():
+            for r in rows:
+                C.add(r.get("customer"))
     for inv in inventories.values():
         for it in inv["items"]:
             C.add(it.get("customer"))
@@ -469,6 +654,15 @@ def build_payload(files, password):
         for inb, outb in per.values():
             for r in inb + outb:
                 r["customer"] = C.canon(r.get("customer"))
+    for name, by_dir in logs.items():
+        for rows in by_dir.values():
+            for r in rows:
+                r["customer"] = C.canon(r.get("customer"))
+        log_store(name, by_dir)
+    if logs:
+        # saved_data.json 은 업로드할 때마다 통째로 갈린다. 이력도 같이 맞춰 준다 —
+        # 안 그러면 파일명이 바뀐 실의 옛 행이 남아 '전체 합계'가 두 배로 잡힌다.
+        log_prune(list(logs))
     for inv in inventories.values():
         bk = defaultdict(float)
         for it in inv["items"]:
@@ -492,7 +686,9 @@ def build_payload(files, password):
     if len(inventories) > 1:
         inventories[ALL] = merge_inventories(list(inventories.values()))
 
-    return dict(offices=offices, inventories=inventories)
+    # 실별 이력 보유 구간 — 기간 입력의 min/max 로 쓴다 (행 자체는 서버가 들고 있다)
+    spans = {o["name"]: log_span(o["name"]) for o in offices}
+    return dict(offices=offices, inventories=inventories, spans=spans)
 
 
 # ---------------------------------------------------------------- Excel 내보내기
@@ -571,6 +767,30 @@ def export_xlsx(payload):
               ["MOBIS ID", "품목 수", "수량"],
               [[m["name"], m["items"], m["qty"]] for m in inv["by_family"]],
               widths=[20, 12, 16])
+    elif view == "log":
+        # 화면은 상한(LOG_MAX_ROWS)까지만 보여주지만 엑셀은 조건에 맞는 전체를 낸다.
+        # 그래서 브라우저가 보낸 행을 쓰지 않고 같은 조건으로 서버가 다시 조회한다.
+        dfrom, dto, q = payload.get("from", ""), payload.get("to", ""), payload.get("q", "")
+        res = log_query(office, dfrom, dto, q, limit=1000000)
+        span = f"{dfrom or '처음'} ~ {dto or '끝'}" + (f" · 검색 '{q}'" if q else "")
+        sheet("요약", f"입출고 이력 · {office} · {span}",
+              ["항목", "값"],
+              [["기간", span], ["입고 건수", res["in"]["cnt"]], ["입고 수량", res["in"]["qty"]],
+               ["출고 건수", res["out"]["cnt"]], ["출고 수량", res["out"]["qty"]],
+               ["순물동(입-출)", res["net"]], ["출고 거래처", res["out"]["customers"]]],
+              widths=[20, 30])
+        sheet("출고", f"출고 이력 · {office} · {span}",
+              ["#", "일자", "거래처", "PART#", "수량", "담당", "문서번호", "비고"],
+              [[i + 1, r["date"], r["customer"], r["part"], r["qty"],
+                r["sales"], r["doc"], r["remark"]]
+               for i, r in enumerate(res["out"]["rows"])],
+              widths=[6, 13, 22, 26, 12, 10, 16, 22])
+        sheet("입고", f"입고 이력 · {office} · {span}",
+              ["#", "일자", "거래처/공급", "PART#", "수량", "담당", "SR#", "FAB", "비고"],
+              [[i + 1, r["date"], r["customer"], r["part"], r["qty"],
+                r["sales"], r["doc"], r["fab"], r["remark"]]
+               for i, r in enumerate(res["in"]["rows"])],
+              widths=[6, 13, 22, 26, 12, 10, 16, 10, 22])
     else:
         day = payload["day"]
         k = day.get("kpi", {})
@@ -947,6 +1167,16 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, f.read())
             else:
                 self._send(200, json.dumps({"offices": []}))
+        elif path == "/log":                             # 기간 조회 (입출고 이력)
+            q = urllib.parse.parse_qs(self.path.partition("?")[2])
+            g = lambda k: (q.get(k) or [""])[0].strip()   # noqa: E731
+            try:
+                self._send(200, json.dumps(
+                    log_query(g("office"), g("from"), g("to"), g("q")),
+                    ensure_ascii=False))
+            except Exception as e:  # noqa: BLE001
+                self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"},
+                                           ensure_ascii=False))
         else:                                            # / , /12 , /3 , /4 , /5 ... 모두 같은 페이지(클라이언트 라우팅)
             self._send(200, PAGE.replace("<!--CHARTJS-->", chart_js()), "text/html; charset=utf-8")
 
@@ -1047,6 +1277,32 @@ header .reload{position:absolute;right:40px;top:30px;background:rgba(255,255,255
 .dayseg button{border:none;background:transparent;font-family:inherit;font-size:13.5px;font-weight:700;color:#777;padding:9px 18px;border-radius:9px;cursor:pointer;transition:.15s;}
 .dayseg button.on{background:#fff;color:var(--ink);box-shadow:0 2px 8px rgba(0,0,0,.1);}
 .dayseg button .tg{font-size:10px;font-weight:800;color:#fff;background:var(--red);border-radius:5px;padding:1px 6px;margin-left:6px;}
+/* 기간 조회 바 */
+.logbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:#fff;border:1.5px solid var(--line);
+  border-radius:14px;padding:12px 14px;margin-bottom:22px;box-shadow:0 1px 2px rgba(0,0,0,.04);}
+.logbar .lab{font-size:11.5px;color:var(--mut);font-weight:700;}
+.logbar input[type=date]{font-family:inherit;font-size:13px;font-weight:600;color:var(--ink);
+  border:1.5px solid var(--line);border-radius:9px;padding:7px 10px;outline:none;}
+.logbar input[type=date]:focus{border-color:var(--red);}
+.logbar .dpair{display:inline-flex;align-items:center;gap:4px;}  /* 좁은 화면에서 날짜 한 쌍이 갈라지지 않게 */
+.logbar .tilde{color:var(--mut);font-weight:700;margin:0 2px;}
+.logbar .pre{border:1.5px solid var(--line);background:#fff;font-family:inherit;font-size:12px;font-weight:700;
+  color:#777;padding:7px 12px;border-radius:9px;cursor:pointer;transition:.15s;}
+.logbar .pre:hover{border-color:#cfcfd6;color:var(--ink);}
+.logbar .pre.on{background:var(--ink);color:#fff;border-color:var(--ink);}
+.logbar .q{flex:1;min-width:240px;font-family:inherit;font-size:13.5px;padding:8px 13px;
+  border:1.5px solid var(--line);border-radius:10px;outline:none;}
+.logbar .q:focus{border-color:var(--red);}
+.logbar .go{border:none;background:var(--red);color:#fff;font-family:inherit;font-size:13px;font-weight:800;
+  padding:9px 18px;border-radius:10px;cursor:pointer;}
+.logbar .go:hover{background:var(--red2);}
+.logbar .off{border:1.5px solid var(--line);background:#fff;font-family:inherit;font-size:12.5px;font-weight:700;
+  color:#777;padding:8px 14px;border-radius:10px;cursor:pointer;}
+.logbar .off:hover{border-color:#cfcfd6;color:var(--ink);}
+.logbar .sep{width:1px;height:22px;background:var(--line);margin:0 2px;}
+.logbar .note{font-size:11.5px;color:var(--mut);width:100%;padding-top:2px;}
+.trunc{padding:10px 16px;background:#fff8e6;color:#8a6d1f;font-size:12px;border-bottom:1px solid var(--line);}
+td.dt{font-variant-numeric:tabular-nums;color:#666;white-space:nowrap;}
 .kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:26px;}
 @media(max-width:1080px){.kpis{grid-template-columns:repeat(3,1fr);}}
 @media(max-width:620px){.kpis{grid-template-columns:repeat(2,1fr);}}
@@ -1170,6 +1426,22 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
   <div class="wrap" id="ioview">
     <div class="offseg" id="offseg"></div>
     <div class="dayseg" id="dayseg"></div>
+
+    <!-- 기간 조회 — 날짜 시트는 오늘·어제뿐이라 누적 시트를 서버가 걸러 준다 -->
+    <div class="logbar" id="logbar" style="display:none">
+      <span class="lab">기간</span>
+      <span class="dpair"><input type="date" id="lg-from"><span class="tilde">~</span><input type="date" id="lg-to"></span>
+      <button class="pre" data-k="m"   onclick="logPreset('m')">이번달</button>
+      <button class="pre" data-k="m3"  onclick="logPreset('m3')">3개월</button>
+      <button class="pre" data-k="y"   onclick="logPreset('y')">올해</button>
+      <button class="pre" data-k="all" onclick="logPreset('all')">전체</button>
+      <span class="sep"></span>
+      <input class="q" id="lg-q" placeholder="거래처 / PART# / 담당 / 비고 검색… (띄어쓰기로 여러 단어)">
+      <button class="go" onclick="runLog()">조회</button>
+      <button class="off" id="lg-off" onclick="exitLog()" style="display:none">← 하루 보기</button>
+      <div class="note" id="lg-note"></div>
+    </div>
+
     <div class="kpis" id="kpis"></div>
     <div class="hl" id="hl" style="display:none"></div>
     <div class="tabs">
@@ -1177,11 +1449,11 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       <button class="tabbtn" id="tb-in" onclick="showTab('in')">입고 내역<span class="n" id="n-in"></span></button>
     </div>
     <div class="tablewrap"><div class="scroll" id="tablearea"></div></div>
-    <div class="grid">
+    <div class="grid" id="iogrid1">
       <div class="card"><h2>어제 vs 오늘 물동</h2><p class="desc">입고·출고 수량 비교</p><div class="cbox"><canvas id="cCompare"></canvas></div></div>
       <div class="card"><h2>오늘 출고 Top 거래처</h2><p class="desc">수량 기준 상위</p><div class="cbox"><canvas id="cCust"></canvas></div></div>
     </div>
-    <div class="grid">
+    <div class="grid" id="iogrid2">
       <div class="card"><h2>담당자별 처리 건수</h2><p class="desc">오늘 입고+출고</p><div class="cbox"><canvas id="cSales"></canvas></div></div>
       <div class="card" id="splitcard"><h2>오늘 요약</h2><p class="desc">한눈에</p><div id="summary"></div></div>
     </div>
@@ -1315,7 +1587,7 @@ function delta(t,y){
 function renderApp(){
   document.getElementById('land').style.display='none';
   document.getElementById('dash').style.display='block';
-  document.getElementById('foot').textContent='자료: 사내 일일 입출고 엑셀 (날짜 시트) · 입고/출고 마스터 시트 미사용 · 파일명 (영업N실)로 실 구분';
+  document.getElementById('foot').textContent='자료: 사내 일일 입출고 엑셀 · 하루 보기는 날짜 시트, 기간 조회는 누적 입고/출고 시트 · 파일명 (영업N실)로 실 구분';
 
   INVS=DATA.inventories||{};
   const hasIO=DATA.offices && DATA.offices.length;
@@ -1354,7 +1626,7 @@ function showView(v){
     document.getElementById('h-date').innerHTML=`재고 현황 <span class="d">·</span> ${esc(INVK)}`;
     document.getElementById('h-meta').textContent=
       `품목 ${fmt(I.n_items)}건 · 총 재고 ${fmt(I.total_qty)} EA`;
-  }else if(O){ showDay(CUR); }
+  }else if(O){ LOGMODE&&LOGRES ? renderLog() : showDay(CUR); }   // 기간 조회 중이었으면 그대로 복귀
 }
 
 // ── Excel 내보내기 (지금 보고 있는 화면 그대로) ──
@@ -1362,8 +1634,12 @@ function exportXlsx(){
   const b=document.getElementById('btn-xls');
   const body = VIEW==='inv'
     ? {office:INVK, view:'inv', inventory:INVS[INVK]}
-    : {office:O.name, view:'io', day:O.days[CUR]};
-  const label = VIEW==='inv' ? `재고_${INVK}` : `입출고_${O.name}_${O.days[CUR].date}`;
+    : LOGMODE                                   // 기간 조회는 화면 상한과 무관하게 전체가 나간다
+      ? {office:O.name, view:'log', ...LOGARGS}
+      : {office:O.name, view:'io', day:O.days[CUR]};
+  const label = VIEW==='inv' ? `재고_${INVK}`
+    : LOGMODE ? `입출고이력_${O.name}_${LOGARGS.from}_${LOGARGS.to}`
+    : `입출고_${O.name}_${O.days[CUR].date}`;
   b.disabled=true; b.textContent='⏳ 만드는 중…';
   fetch('/export',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)})
@@ -1396,6 +1672,7 @@ function renderOffice(){
     return `<button onclick="showDay(${i})">${esc(d)}${lab?'<span class="tg">'+lab+'</span>':''}</button>`;
   }).join('');
   drawCompare();
+  initLogbar();
   showDay(O.today_idx);
 }
 
@@ -1428,7 +1705,7 @@ fetch('/data').then(r=>r.json()).then(d=>{
 }).catch(()=>{});
 
 function showDay(idx){
-  CUR=idx;
+  CUR=idx; exitLogUI();
   const day=O.days[idx], prev=idx>0?O.days[idx-1]:null, k=day.kpi, pk=prev?prev.kpi:null;
   document.querySelectorAll('#dayseg button').forEach((b,i)=>b.classList.toggle('on',i===idx));
   const tag=idx===O.today_idx?'오늘':(idx===O.today_idx-1?'어제':'선택일');
@@ -1548,6 +1825,136 @@ function showTab(which){
   document.getElementById('tb-in').classList.toggle('on',which==='in');
   document.getElementById('tablearea').innerHTML=TB[which]||'';
 }
+
+// ================= 기간 조회 (입출고 이력) =================
+// 실당 6만 행이라 브라우저로 다 못 내린다. 조건만 서버에 보내고 걸러진 것만 받는다.
+// 하루 보기(날짜 버튼)와 같은 표 자리를 쓰되, 하루짜리가 아닌 기간 집계를 보여준다.
+let LOGMODE=false, LOGRES=null, LOGARGS={from:'',to:'',q:''}, LOGTMR=null;
+
+const iso=d=>new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,10);
+function isoAdd(s,days){ const d=new Date(s+'T00:00:00'); d.setDate(d.getDate()+days); return iso(d); }
+function logSpan(){ return (DATA.spans||{})[O.name]||{min:'',max:'',rows:0}; }
+
+function initLogbar(){
+  const sp=logSpan(), bar=document.getElementById('logbar');
+  if(!sp.rows){ bar.style.display='none'; return; }      // 이력 없는 실은 기간 조회 자체를 숨긴다
+  bar.style.display='flex';
+  const f=document.getElementById('lg-from'), t=document.getElementById('lg-to');
+  f.min=t.min=sp.min; f.max=t.max=sp.max;
+  document.getElementById('lg-note').textContent=
+    `이력 ${sp.min} ~ ${sp.max} · ${fmt(sp.rows)}행 (누적 입고/출고 시트) · 기간을 고르면 그 구간 전체를 합산해 보여줍니다`;
+  logPreset('m', true);
+}
+
+// 기준점은 오늘이 아니라 '이력의 마지막 날'이다 — 누적 시트는 하루 이틀 늦게 채워진다.
+function logPreset(kind, quiet){
+  const sp=logSpan(), end=sp.max||iso(new Date());
+  let start=end;
+  if(kind==='m')   start=end.slice(0,8)+'01';
+  if(kind==='m3')  start=isoAdd(end,-90);
+  if(kind==='y')   start=end.slice(0,4)+'-01-01';
+  if(kind==='all') start=sp.min||end;
+  if(sp.min && start<sp.min) start=sp.min;
+  document.getElementById('lg-from').value=start;
+  document.getElementById('lg-to').value=end;
+  document.querySelectorAll('#logbar .pre').forEach(b=>b.classList.toggle('on',b.dataset.k===kind));
+  if(!quiet) runLog();
+}
+
+function runLog(){
+  const from=document.getElementById('lg-from').value,
+        to  =document.getElementById('lg-to').value,
+        q   =document.getElementById('lg-q').value.trim();
+  if(from && to && from>to){
+    document.getElementById('tablearea').innerHTML=
+      '<div style="padding:40px;text-align:center;color:var(--red);font-size:13px">시작일이 종료일보다 뒤입니다</div>';
+    return;
+  }
+  LOGARGS={from,to,q};
+  document.getElementById('tablearea').innerHTML=
+    '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조회 중…</div>';
+  fetch(`/log?office=${encodeURIComponent(O.name)}&from=${from}&to=${to}&q=${encodeURIComponent(q)}`)
+    .then(r=>r.json()).then(res=>{
+      if(res.error) throw new Error(res.error);
+      LOGRES=res; LOGMODE=true; renderLog();
+    }).catch(e=>{
+      document.getElementById('tablearea').innerHTML=
+        `<div style="padding:40px;text-align:center;color:var(--red);font-size:13px">조회 실패 — ${esc(e.message)}</div>`;
+    });
+}
+
+function renderLog(){
+  const r=LOGRES, {from,to,q}=LOGARGS;
+  document.querySelectorAll('#dayseg button').forEach(b=>b.classList.remove('on'));
+  document.getElementById('lg-off').style.display='';
+  document.getElementById('hl').style.display='none';
+  document.getElementById('iogrid1').style.display='none';   // 차트는 하루 기준이라 기간에선 의미가 없다
+  document.getElementById('iogrid2').style.display='none';
+
+  document.getElementById('h-date').innerHTML=
+    `${esc(O.name)} <span class="d">·</span> ${esc(from||'처음')} ~ ${esc(to||'끝')}`;
+  document.getElementById('h-meta').textContent=
+    `기간 조회${q?` · 검색 "${q}"`:''} · 입고 ${fmt(r.in.cnt)}건 / 출고 ${fmt(r.out.cnt)}건`;
+  document.getElementById('kpis').innerHTML=[
+    ['in','입고 건수',r.in.cnt,'건'],['in','입고 수량',r.in.qty,'EA'],
+    ['out','출고 건수',r.out.cnt,'건'],['out','출고 수량',r.out.qty,'EA'],
+    ['net','순물동(입-출)',r.net,'EA'],['cu','거래처(출고)',r.out.customers,'곳'],
+  ].map(([c,l,v,u])=>`<div class="kpi ${c}"><div class="l">${l}</div>
+     <div class="v tab">${fmt(v)}<span class="u">${u}</span></div><span class="d fl">&nbsp;</span></div>`).join('');
+
+  document.getElementById('n-out').textContent=r.out.cnt;
+  document.getElementById('n-in').textContent=r.in.cnt;
+
+  const none=`<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조건에 맞는 내역이 없습니다</div>`;
+  const cap=s=>s.truncated?`<div class="trunc">전체 ${fmt(s.cnt)}건 중 최근 ${fmt(s.shown)}건만 표시합니다 —
+    기간을 좁히거나 검색어를 넣어 보세요. <b>⬇ Excel 내보내기는 전체가 나갑니다.</b></div>`:'';
+
+  TB={
+    out: !r.out.rows.length?none:cap(r.out)+`<table><thead><tr><th>#</th><th>일자</th><th>거래처</th><th>PART#</th>
+      <th class="n">수량</th><th>담당</th><th>문서번호</th><th>비고</th></tr></thead><tbody>${
+      r.out.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
+        <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
+        <td class="qty">${fmt(x.qty)}</td><td>${esc(x.sales)}</td>
+        <td>${esc(x.doc)||'—'}</td><td style="color:#888">${esc(x.remark)||''}</td></tr>`).join('')}</tbody></table>`,
+    in: !r.in.rows.length?none:cap(r.in)+`<table><thead><tr><th>#</th><th>일자</th><th>거래처/공급</th><th>PART#</th>
+      <th class="n">수량</th><th>담당</th><th>FAB</th><th>비고</th></tr></thead><tbody>${
+      r.in.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
+        <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
+        <td class="qty">${fmt(x.qty)}</td><td>${esc(x.sales)}</td>
+        <td>${esc(x.fab)?'<span class="pill">FAB '+esc(x.fab)+'</span>':'—'}</td>
+        <td style="color:#888">${esc(x.remark)||''}</td></tr>`).join('')}</tbody></table>`,
+  };
+  showTab(TBcur);
+}
+
+// 하루 보기로 돌아갈 때 기간 조회의 흔적만 걷어낸다 (showDay 가 나머지를 다시 그린다)
+function exitLogUI(){
+  LOGMODE=false;
+  const off=document.getElementById('lg-off');
+  if(off) off.style.display='none';
+  const g1=document.getElementById('iogrid1'), g2=document.getElementById('iogrid2');
+  if(g1) g1.style.display=''; if(g2) g2.style.display='';
+}
+function exitLog(){
+  document.getElementById('lg-q').value='';
+  showDay(CUR);
+}
+
+// 검색은 타이핑이 멎으면 자동 조회 — 재고 현황 검색창과 같은 감각으로 맞췄다
+document.addEventListener('DOMContentLoaded',()=>{
+  const q=document.getElementById('lg-q');
+  if(q){
+    q.addEventListener('input',()=>{ clearTimeout(LOGTMR); LOGTMR=setTimeout(runLog,350); });
+    q.addEventListener('keydown',e=>{ if(e.key==='Enter'){ clearTimeout(LOGTMR); runLog(); } });
+  }
+  ['lg-from','lg-to'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('change',()=>{
+      document.querySelectorAll('#logbar .pre').forEach(b=>b.classList.remove('on'));
+      runLog();
+    });
+  });
+});
 
 // ================= 재고 현황 =================
 let ICH={}, ITAB='all';
