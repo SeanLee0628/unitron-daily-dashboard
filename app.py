@@ -1378,6 +1378,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(
                 {"map": pm["exact"], "loose": pm["loose"], "rows": pm["rows"]},
                 ensure_ascii=False))
+        elif path == "/health":                          # 저장소 진단 (디스크가 실제로 붙었나)
+            # 데이터가 재시작마다 사라질 때 원인을 눈으로 확인하려고 둔다.
+            # 비밀번호·계정 같은 건 절대 싣지 않는다. 경로와 참/거짓만.
+            d = os.path.dirname(LOG_DB)
+            info = {"DATA_DIR": os.environ.get("DATA_DIR") or "(미설정 → 앱 폴더 사용)",
+                    "db_path": LOG_DB, "dir_exists": os.path.isdir(d)}
+            try:
+                probe = os.path.join(d, ".write_test")
+                with open(probe, "w") as f:
+                    f.write("x")
+                os.remove(probe)
+                info["writable"] = True
+            except Exception as e:  # noqa: BLE001
+                info["writable"] = False
+                info["write_error"] = str(e)
+            try:
+                # 마운트된 디스크는 앱 폴더와 device 번호가 다르다 — 이게 결정적 단서다
+                info["separate_mount"] = os.stat(d).st_dev != os.stat(HERE).st_dev
+            except Exception:
+                info["separate_mount"] = None
+            info["db_bytes"] = os.path.getsize(LOG_DB) if os.path.exists(LOG_DB) else 0
+            info["saved_data_exists"] = os.path.exists(DATA_FILE)
+            try:
+                cx = log_conn()
+                info["log_rows"] = cx.execute("SELECT COUNT(*) FROM log").fetchone()[0]
+                info["ship_rows"] = cx.execute("SELECT COUNT(*) FROM ship").fetchone()[0]
+                cx.close()
+            except Exception as e:  # noqa: BLE001
+                info["db_error"] = str(e)
+            self._send(200, json.dumps(info, ensure_ascii=False, indent=1))
         elif path == "/day":                             # 누적 이력에서 하루치 되살리기
             q = urllib.parse.parse_qs(self.path.partition("?")[2])
             g = lambda k: (q.get(k) or [""])[0].strip()   # noqa: E731
