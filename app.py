@@ -265,7 +265,16 @@ def log_conn():
     cx.execute("""CREATE TABLE IF NOT EXISTS log(
         office TEXT, dir TEXT, date TEXT, customer TEXT, part TEXT, qty REAL,
         sales TEXT, doc TEXT, mcode TEXT, remark TEXT, fab TEXT)""")
+    # 실 키를 이름 대신 번호(슬러그)로 쓴다. 파일명이 바뀌어도 같은 실로 인식되어
+    # 이름이 달라졌다는 이유로 이력이 두 벌 쌓이는 일이 없다.
+    cols = {r[1] for r in cx.execute("PRAGMA table_info(log)")}
+    if "slug" not in cols:
+        cx.execute("ALTER TABLE log ADD COLUMN slug TEXT")
+        for (name,) in cx.execute("SELECT DISTINCT office FROM log").fetchall():
+            cx.execute("UPDATE log SET slug=? WHERE office=?", (office_slug(name), name))
+        cx.commit()
     cx.execute("CREATE INDEX IF NOT EXISTS ix_log ON log(office, dir, date)")
+    cx.execute("CREATE INDEX IF NOT EXISTS ix_log_slug ON log(slug, dir, date)")
     # 선적 리포트(PO# → 발주업체). 주간 파일을 올릴 때마다 누적된다.
     # 같은 운송장·PO·파트·SO 로 수량만 다른 분할 선적이 실제로 있어서 qty 까지 키에 넣는다 —
     # 안 그러면 3,000EA 와 750EA 중 하나가 조용히 사라진다.
@@ -284,28 +293,31 @@ def log_conn():
 
 
 def log_store(office, by_dir):
-    """실 1개의 이력을 통째로 갈아끼운다 — 재업로드하면 그 파일이 기준이 된다.
-    업로드하지 않은 실의 이력은 건드리지 않는다."""
+    """이력을 (실, 날짜) 단위로만 갈아끼운다 — 대시보드가 거울이 아니라 금고가 되도록.
+
+    올린 파일에 들어 있는 날짜만 지우고 새로 넣는다. 파일에 없는 과거 날짜는 그대로
+    둔다. 그래서 회사에서 누적 시트를 정리하거나 새 연도 파일로 갈아타도, 한 실만
+    올려도, 이미 쌓인 이력은 남는다. 같은 날짜를 다시 올리면 그 날짜만 교체되므로
+    정정분은 그대로 반영된다.
+    """
+    slug = office_slug(office)
+    rows = [(office, slug, d, r["date"], r["customer"], r["part"], r["qty"],
+             r["sales"], r["doc"], r["mcode"], r["remark"], r["fab"])
+            for d, rs in by_dir.items() for r in rs]
+    dates = sorted({r[3] for r in rows})
     cx = log_conn()
     try:
-        cx.execute("DELETE FROM log WHERE office=?", (office,))
-        cx.executemany("INSERT INTO log VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                       [(office, d, r["date"], r["customer"], r["part"], r["qty"],
-                         r["sales"], r["doc"], r["mcode"], r["remark"], r["fab"])
-                        for d, rows in by_dir.items() for r in rows])
+        for i in range(0, len(dates), 400):             # SQLite 변수 상한(999) 안쪽으로
+            chunk = dates[i:i + 400]
+            cx.execute("DELETE FROM log WHERE slug=? AND date IN (%s)"
+                       % ",".join("?" * len(chunk)), [slug] + chunk)
+        cx.executemany(
+            "INSERT INTO log(office,slug,dir,date,customer,part,qty,sales,doc,mcode,remark,fab) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        # 같은 실을 다른 이름으로 올린 적이 있으면 표시 이름만 최신으로 맞춘다
+        cx.execute("UPDATE log SET office=? WHERE slug=? AND office<>?", (office, slug, office))
         cx.commit()
-    finally:
-        cx.close()
-
-
-def log_prune(keep):
-    """이번 업로드에 없는 실의 이력은 버린다 (실 이름이 바뀌면 옛 행이 유령으로 남는다)."""
-    cx = log_conn()
-    try:
-        cx.execute("DELETE FROM log WHERE office NOT IN (%s)"
-                   % ",".join("?" * len(keep)), keep)
-        cx.commit()
-        cx.execute("VACUUM")
+        return len(rows), len(dates)
     finally:
         cx.close()
 
@@ -329,7 +341,7 @@ def _log_where(office, dfrom, dto, conds):
     """
     where, args = [], []
     if office and office != ALL:                    # 전체 합계 = 실 구분 없이 전부
-        where.append("office=?"); args.append(office)
+        where.append("slug=?"); args.append(office_slug(office))
     if dfrom:
         where.append("date>=?"); args.append(dfrom)
     if dto:
@@ -376,13 +388,53 @@ def log_query(office, dfrom, dto, conds, sort="date", direction="desc",
     return out
 
 
+def log_day(office, date):
+    """누적 이력에서 하루치를 꺼내 하루 보기와 똑같은 모양으로 만든다.
+
+    업로드한 파일의 날짜 시트는 오늘·어제뿐이라, 그보다 과거를 하루 보기로 열려면
+    DB 에서 되살려야 한다. day_block() 을 그대로 써서 KPI·차트·요약이 같은 계산을 탄다.
+    """
+    where, args = ["date=?"], [date]
+    if office and office != ALL:
+        where.append("slug=?"); args.append(office_slug(office))
+    sql = " AND ".join(where)
+    cx = log_conn()
+    try:
+        rows = {"in": [], "out": []}
+        for d, cust, part, qty, sales, doc, remark, fab in cx.execute(
+                f"SELECT dir,customer,part,qty,sales,doc,remark,fab FROM log WHERE {sql}", args):
+            rows[d].append(dict(customer=cust, part=part, qty=qty, sales=sales,
+                                doc=doc, remark=remark, fab=fab, vendor=""))
+        # 비교 기준이 될 직전 영업일 (달력상 전날이 아니라 '자료가 있는 전날')
+        prev = cx.execute(f"SELECT MAX(date) FROM log WHERE date<? AND "
+                          f"{sql.replace('date=?', '1=1')}", [date] + args[1:]).fetchone()[0]
+    finally:
+        cx.close()
+    return day_block(date, rows["in"], rows["out"]), prev
+
+
+def log_dates(office, limit=400):
+    """그 실에 자료가 있는 날짜 목록 (최근 순). 하루 보기 달력의 선택지."""
+    where, args = [], []
+    if office and office != ALL:
+        where.append("slug=?"); args.append(office_slug(office))
+    sql = " AND ".join(where) or "1=1"
+    cx = log_conn()
+    try:
+        return [d for (d,) in cx.execute(
+            f"SELECT DISTINCT date FROM log WHERE {sql} ORDER BY date DESC LIMIT ?",
+            args + [limit])]
+    finally:
+        cx.close()
+
+
 def log_span(office=None):
     """그 실의 이력이 언제부터 언제까지 있는지 — 달력 입력의 범위로 쓴다."""
     cx = log_conn()
     try:
         if office and office != ALL:
             row = cx.execute("SELECT MIN(date),MAX(date),COUNT(*) FROM log "
-                             "WHERE office=?", (office,)).fetchone()
+                             "WHERE slug=?", (office_slug(office),)).fetchone()
         else:
             row = cx.execute("SELECT MIN(date),MAX(date),COUNT(*) FROM log").fetchone()
     finally:
@@ -808,10 +860,6 @@ def build_payload(files, password):
             for r in rows:
                 r["customer"] = C.canon(r.get("customer"))
         log_store(name, by_dir)
-    if logs:
-        # saved_data.json 은 업로드할 때마다 통째로 갈린다. 이력도 같이 맞춰 준다 —
-        # 안 그러면 파일명이 바뀐 실의 옛 행이 남아 '전체 합계'가 두 배로 잡힌다.
-        log_prune(list(logs))
     for inv in inventories.values():
         bk = defaultdict(float)
         for it in inv["items"]:
@@ -1330,6 +1378,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(
                 {"map": pm["exact"], "loose": pm["loose"], "rows": pm["rows"]},
                 ensure_ascii=False))
+        elif path == "/day":                             # 누적 이력에서 하루치 되살리기
+            q = urllib.parse.parse_qs(self.path.partition("?")[2])
+            g = lambda k: (q.get(k) or [""])[0].strip()   # noqa: E731
+            try:
+                day, prev_date = log_day(g("office"), g("date"))
+                prev = log_day(g("office"), prev_date)[0] if prev_date else None
+                self._send(200, json.dumps({"day": day, "prev": prev},
+                                           ensure_ascii=False))
+            except Exception as e:  # noqa: BLE001
+                self._send(500, json.dumps({"error": f"{type(e).__name__}: {e}"},
+                                           ensure_ascii=False))
+        elif path == "/days":                            # 자료가 있는 날짜 목록
+            q = urllib.parse.parse_qs(self.path.partition("?")[2])
+            self._send(200, json.dumps(
+                log_dates((q.get("office") or [""])[0].strip()), ensure_ascii=False))
         elif path == "/log":                             # 기간 조회 (입출고 이력)
             q = urllib.parse.parse_qs(self.path.partition("?")[2])
             g = lambda k: (q.get(k) or [""])[0].strip()   # noqa: E731
@@ -1453,6 +1516,10 @@ header .reload{position:absolute;right:40px;top:30px;background:rgba(255,255,255
 .dayseg button{border:none;background:transparent;font-family:inherit;font-size:13.5px;font-weight:700;color:#777;padding:9px 18px;border-radius:9px;cursor:pointer;transition:.15s;}
 .dayseg button.on{background:#fff;color:var(--ink);box-shadow:0 2px 8px rgba(0,0,0,.1);}
 .dayseg button .tg{font-size:10px;font-weight:800;color:#fff;background:var(--red);border-radius:5px;padding:1px 6px;margin-left:6px;}
+.daypickwrap{display:inline-flex;align-items:center;gap:5px;padding:0 8px 0 10px;font-size:12px;color:var(--mut);}
+.daypickwrap input[type=date]{font-family:inherit;font-size:12.5px;font-weight:700;color:var(--ink);
+  border:1.5px solid #dcdce3;background:#fff;border-radius:8px;padding:6px 8px;outline:none;cursor:pointer;}
+.daypickwrap input[type=date]:focus{border-color:var(--red);}
 /* 기간 조회 바 */
 .logbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:#fff;border:1.5px solid var(--line);
   border-radius:14px;padding:12px 14px;margin-bottom:22px;box-shadow:0 1px 2px rgba(0,0,0,.04);}
@@ -1851,10 +1918,10 @@ function exportXlsx(){
     ? {office:INVK, view:'inv', inventory:INVS[INVK]}
     : LOGMODE                                   // 기간 조회는 화면 상한과 무관하게 전체가 나간다
       ? {office:O.name, view:'log', ...LOGARGS}
-      : {office:O.name, view:'io', day:O.days[CUR]};
+      : {office:O.name, view:'io', day:CURDAY||O.days[CUR]};
   const label = VIEW==='inv' ? `재고_${INVK}`
     : LOGMODE ? `입출고이력_${O.name}_${LOGARGS.from||'처음'}_${LOGARGS.to||'끝'}`
-    : `입출고_${O.name}_${O.days[CUR].date}`;
+    : `입출고_${O.name}_${(CURDAY||O.days[CUR]).date}`;
   b.disabled=true; b.textContent='⏳ 만드는 중…';
   fetch('/export',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body)})
@@ -1882,10 +1949,14 @@ function selectOffice(i){
   renderOffice();
 }
 function renderOffice(){
+  // 파일에 있는 날짜(오늘·어제)는 버튼으로, 그 이전은 달력으로 — 누적 이력에서 되살린다
+  const sp=logSpan();
   document.getElementById('dayseg').innerHTML=O.dates.map((d,i)=>{
     const lab=i===O.today_idx?'오늘':(i===O.today_idx-1?'어제':'');
     return `<button onclick="showDay(${i})">${esc(d)}${lab?'<span class="tg">'+lab+'</span>':''}</button>`;
-  }).join('');
+  }).join('')+(sp.rows?
+    `<span class="daypickwrap">📅 <input type="date" id="daypick" title="과거 날짜 보기"
+       min="${sp.min}" max="${sp.max}" onchange="showPickedDay(this.value)"></span>`:'');
   drawCompare();
   initLogbar();
   showDay(O.today_idx);
@@ -1919,11 +1990,44 @@ fetch('/data').then(r=>r.json()).then(d=>{
   if(d && d.offices && d.offices.length){ DATA=d; renderApp(); }
 }).catch(()=>{});
 
+// 업로드한 파일에 있는 날짜(오늘·어제)는 그대로 쓰고,
+// 그보다 과거는 누적 이력에서 서버가 되살려 준다 — 같은 renderDay 를 탄다.
 function showDay(idx){
-  CUR=idx; exitLogUI();
-  const day=O.days[idx], prev=idx>0?O.days[idx-1]:null, k=day.kpi, pk=prev?prev.kpi:null;
+  CUR=idx; PICKED='';
+  const el=document.getElementById('daypick'); if(el) el.value='';
+  renderDay(O.days[idx], idx>0?O.days[idx-1]:null,
+            idx===O.today_idx?'오늘':(idx===O.today_idx-1?'어제':'선택일'), idx);
+}
+
+let PICKED='';                              // 달력으로 고른 과거 날짜 ('' 면 파일의 날짜를 보는 중)
+function showPickedDay(date){
+  if(!date) return;
+  PICKED=date;
+  const pk=document.getElementById('daypick');
+  if(pk) pk.value=date;                     // 코드로 불렀을 때도 달력이 그 날짜를 가리키게
+  const i=O.dates.indexOf(date);
+  if(i>=0){ showDay(i); if(pk) pk.value=date; PICKED=date; return; }
+  document.getElementById('tablearea').innerHTML=
+    '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">불러오는 중…</div>';
+  fetch(`/day?office=${encodeURIComponent(O.name)}&date=${date}`)
+    .then(r=>r.json()).then(res=>{
+      if(res.error) throw new Error(res.error);
+      if(!res.day || (!res.day.in_rows.length && !res.day.out_rows.length)){
+        document.getElementById('tablearea').innerHTML=
+          `<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">${esc(date)} 자료가 없습니다 (휴일이거나 미기재)</div>`;
+        return;
+      }
+      renderDay(res.day, res.prev, '선택일', -1);
+    }).catch(e=>{
+      document.getElementById('tablearea').innerHTML=
+        `<div style="padding:40px;text-align:center;color:var(--red);font-size:13px">불러오기 실패 — ${esc(e.message)}</div>`;
+    });
+}
+
+function renderDay(day, prev, tag, idx){
+  exitLogUI();
+  const k=day.kpi, pk=prev?prev.kpi:null;
   document.querySelectorAll('#dayseg button').forEach((b,i)=>b.classList.toggle('on',i===idx));
-  const tag=idx===O.today_idx?'오늘':(idx===O.today_idx-1?'어제':'선택일');
   document.getElementById('h-date').innerHTML=`${esc(O.name)} <span class="d">·</span> ${esc(day.date)} ${tag}`;
   document.getElementById('h-meta').textContent=`${prev?'비교 기준 '+prev.date+' · ':'이전일 데이터 없음 · '}입고 ${fmt(k.in_cnt)}건 / 출고 ${fmt(k.out_cnt)}건`;
   document.getElementById('kpis').innerHTML=[
@@ -1942,6 +2046,7 @@ function showDay(idx){
       <div class="txt"><b>${esc(h.customer)}</b> 에 <b>${esc(h.part)}</b> <span class="q">${fmt(h.qty)}</span> EA 출고 · 담당 ${esc(h.sales)}</div>`;
   } else hlEl.style.display='none';
 
+  CURDAY=day;                               // 정렬·검색이 다시 그릴 때 쓸 현재 하루
   buildSummary(day, prev, tag);
   drawDayCharts(day); buildTables(day); showTab(TBcur);
 }
@@ -2025,8 +2130,9 @@ function noHit(){return '<div style="padding:40px;text-align:center;color:#aaa;f
 
 const IO_ALL=r=>[r.customer,r.part,r.sales,r.doc,r.remark,r.fab];
 let DSORT={k:'',d:0};                      // 하루 보기 정렬 (기본 = 엑셀 순서)
+let CURDAY=null;                           // 지금 보고 있는 하루 (파일의 날짜일 수도, 달력으로 고른 과거일 수도)
 
-function sortDay(key){ nextDir(DSORT,key); buildTables(O.days[CUR]); showTab(TBcur); }
+function sortDay(key){ nextDir(DSORT,key); buildTables(CURDAY); showTab(TBcur); }
 
 function buildTables(day){
   const conds=condsOf('io');
@@ -2054,7 +2160,7 @@ function buildTables(day){
 // 검색줄은 하루 보기와 기간 조회가 같이 쓴다 — 어느 쪽이 떠 있느냐에 따라 갈린다
 function applyIoSearch(){
   if(LOGMODE) runLog();
-  else { buildTables(O.days[CUR]); showTab(TBcur); }
+  else if(CURDAY){ buildTables(CURDAY); showTab(TBcur); }
 }
 function clearIoSearch(){ clearFields('io'); applyIoSearch(); }
 function showTab(which){
