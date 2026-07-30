@@ -187,6 +187,10 @@ def parse_workbook(wb):
 # 실당 6만 행이라 브라우저로 통째 내려보낼 수 없어서 SQLite 에 넣고 서버가 걸러 준다.
 LOG_DIRS = {"in": ("입고", "INBOUND"), "out": ("출고", "OUTBOUND")}
 LOG_MAX_ROWS = 3000              # 화면에 한 번에 내려보낼 행 상한 (집계는 전체 기준으로 낸다)
+# 전사 출고 원장(shipping management)은 실 소속이 없다. 실별 이력과 섞이면 같은 출고가
+# 두 번 잡히므로 자기만의 slug 를 쓰고, '전체 합계' 집계에서도 빠진다.
+LEDGER = "전체 출고 원장"
+LEDGER_SLUG = "sm"
 
 
 def norm_date(v):
@@ -265,6 +269,15 @@ def log_conn():
     cx.execute("""CREATE TABLE IF NOT EXISTS log(
         office TEXT, dir TEXT, date TEXT, customer TEXT, part TEXT, qty REAL,
         sales TEXT, doc TEXT, mcode TEXT, remark TEXT, fab TEXT)""")
+    # src: 이 행이 어느 시트에서 왔나. 'sm'(shipping management) 이 'sheet'(누적 출고) 를 이긴다.
+    # 같은 출고를 두 시트가 다르게 적고 있어서(누적=주문 단위, sm=lot 단위) 우선순위가 없으면
+    # 마지막에 올린 파일이 이기는 비결정적 동작이 된다.
+    for col in ("src", "lot", "dcode"):
+        if col not in {r[1] for r in cx.execute("PRAGMA table_info(log)")}:
+            cx.execute(f"ALTER TABLE log ADD COLUMN {col} TEXT")
+            if col == "src":
+                cx.execute("UPDATE log SET src='sheet' WHERE src IS NULL")
+            cx.commit()
     # 실 키를 이름 대신 번호(슬러그)로 쓴다. 파일명이 바뀌어도 같은 실로 인식되어
     # 이름이 달라졌다는 이유로 이력이 두 벌 쌓이는 일이 없다.
     cols = {r[1] for r in cx.execute("PRAGMA table_info(log)")}
@@ -292,32 +305,41 @@ def log_conn():
     return cx
 
 
-def log_store(office, by_dir):
-    """이력을 (실, 날짜) 단위로만 갈아끼운다 — 대시보드가 거울이 아니라 금고가 되도록.
+def log_store(office, by_dir, src="sheet"):
+    """이력을 (실, 방향, 날짜) 단위로만 갈아끼운다 — 대시보드가 거울이 아니라 금고가 되도록.
 
     올린 파일에 들어 있는 날짜만 지우고 새로 넣는다. 파일에 없는 과거 날짜는 그대로
     둔다. 그래서 회사에서 누적 시트를 정리하거나 새 연도 파일로 갈아타도, 한 실만
     올려도, 이미 쌓인 이력은 남는다. 같은 날짜를 다시 올리면 그 날짜만 교체되므로
     정정분은 그대로 반영된다.
+
+    src 는 이 행이 어느 시트에서 왔는지만 기록한다 ('sheet'=누적 입고/출고, 'sm'=출고 원장).
+    원장은 실 소속이 없어 slug 가 달라서, 실별 이력과 서로 덮어쓰지 않는다.
     """
-    slug = office_slug(office)
-    rows = [(office, slug, d, r["date"], r["customer"], r["part"], r["qty"],
-             r["sales"], r["doc"], r["mcode"], r["remark"], r["fab"])
-            for d, rs in by_dir.items() for r in rs]
-    dates = sorted({r[3] for r in rows})
+    slug = LEDGER_SLUG if office == LEDGER else office_slug(office)
     cx = log_conn()
     try:
-        for i in range(0, len(dates), 400):             # SQLite 변수 상한(999) 안쪽으로
-            chunk = dates[i:i + 400]
-            cx.execute("DELETE FROM log WHERE slug=? AND date IN (%s)"
-                       % ",".join("?" * len(chunk)), [slug] + chunk)
-        cx.executemany(
-            "INSERT INTO log(office,slug,dir,date,customer,part,qty,sales,doc,mcode,remark,fab) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        total = 0
+        for d, rs in by_dir.items():
+            if not rs:
+                continue
+            dates = sorted({r["date"] for r in rs})
+            for i in range(0, len(dates), 400):         # SQLite 변수 상한(999) 안쪽으로
+                chunk = dates[i:i + 400]
+                cx.execute("DELETE FROM log WHERE slug=? AND dir=? AND date IN (%s)"
+                           % ",".join("?" * len(chunk)), [slug, d] + chunk)
+            rows = [(office, slug, d, r["date"], r["customer"], r["part"], r["qty"],
+                     r["sales"], r.get("doc", ""), r.get("mcode", ""), r.get("remark", ""),
+                     r.get("fab", ""), src, r.get("lot", ""), r.get("dcode", ""))
+                    for r in rs]
+            cx.executemany(
+                "INSERT INTO log(office,slug,dir,date,customer,part,qty,sales,doc,mcode,"
+                "remark,fab,src,lot,dcode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            total += len(rows)
         # 같은 실을 다른 이름으로 올린 적이 있으면 표시 이름만 최신으로 맞춘다
         cx.execute("UPDATE log SET office=? WHERE slug=? AND office<>?", (office, slug, office))
         cx.commit()
-        return len(rows), len(dates)
+        return total
     finally:
         cx.close()
 
@@ -326,11 +348,21 @@ def log_store(office, by_dir):
 # (정렬 키가 SQL 에 그대로 들어가므로 화이트리스트가 곧 주입 차단이다).
 LOG_FIELDS = {"customer": "customer", "part": "part", "sales": "sales",
               "doc": "doc", "mcode": "mcode", "remark": "remark", "date": "date",
-              "fab": "fab"}
-LOG_ALL_COLS = ["customer", "part", "sales", "doc", "mcode", "remark"]
+              "fab": "fab", "lot": "lot", "dcode": "dcode"}
+LOG_ALL_COLS = ["customer", "part", "sales", "doc", "mcode", "remark", "lot", "dcode"]
 LOG_SORTS = dict(LOG_FIELDS, qty="qty")
 FIELD_KO = {"customer": "거래처", "part": "PART#", "sales": "담당",
-            "doc": "문서번호", "mcode": "Material Code", "remark": "비고", "date": "일자"}
+            "doc": "문서번호", "mcode": "Material Code", "remark": "비고", "date": "일자",
+            "lot": "lot number", "dcode": "DATECODE"}
+
+
+def log_scope(office):
+    """실 범위 → (SQL 조각, 인자). 원장은 실 소속이 없어 항상 따로 다룬다."""
+    if office == LEDGER:
+        return "slug=?", [LEDGER_SLUG]              # 전사 출고 원장만
+    if office and office != ALL:
+        return "slug=?", [office_slug(office)]      # 그 실만
+    return "slug<>?", [LEDGER_SLUG]                 # 전체 합계 = 실 전부, 원장 제외
 
 
 def _log_where(office, dfrom, dto, conds):
@@ -339,9 +371,8 @@ def _log_where(office, dfrom, dto, conds):
     conds 는 [(칸, 값)] 이고 전부 AND 다. 칸이 'all'(또는 빈 값)이면 모든 칸을 훑는다.
     한 칸 안에서는 공백으로 나눈 단어를 다시 AND 로 묶는다.
     """
-    where, args = [], []
-    if office and office != ALL:                    # 전체 합계 = 실 구분 없이 전부
-        where.append("slug=?"); args.append(office_slug(office))
+    sc, args = log_scope(office)
+    where = [sc]
     if dfrom:
         where.append("date>=?"); args.append(dfrom)
     if dto:
@@ -375,9 +406,9 @@ def log_query(office, dfrom, dto, conds, sort="date", direction="desc",
                 f"SELECT COUNT(*),COALESCE(SUM(qty),0),COUNT(DISTINCT customer) "
                 f"FROM log WHERE dir=? AND {sql}", [d] + args).fetchone()
             rows = [dict(date=a, customer=b, part=c, qty=round(e), sales=f,
-                         doc=g, mcode=h, remark=i, fab=j)
-                    for a, b, c, e, f, g, h, i, j in cx.execute(
-                        f"SELECT date,customer,part,qty,sales,doc,mcode,remark,fab "
+                         doc=g, mcode=h, remark=i, fab=j, lot=k or "", dcode=l or "")
+                    for a, b, c, e, f, g, h, i, j, k, l in cx.execute(
+                        f"SELECT date,customer,part,qty,sales,doc,mcode,remark,fab,lot,dcode "
                         f"FROM log WHERE dir=? AND {sql} ORDER BY {order} "
                         f"LIMIT ?", [d] + args + [limit])]
             out[d] = dict(cnt=cnt, qty=round(qty), customers=custs,
@@ -388,26 +419,75 @@ def log_query(office, dfrom, dto, conds, sort="date", direction="desc",
     return out
 
 
+def shipmgmt_sheet(wb):
+    """재고 파일의 'shipping management' 시트. 이름이 아니라 헤더로 찾는다."""
+    for s in wb.sheetnames:
+        for r in wb[s].iter_rows(min_row=1, max_row=6, values_only=True):
+            if r and {"DATE", "CUSTOMER", "PART#", "QTY"} <= {_hkey(c) for c in r if clean(c)}:
+                return wb[s]
+    return None
+
+
+def parse_shipmgmt(ws):
+    """shipping management → 출고 행 목록.
+
+    누적 '출고' 시트가 주문 단위인 데 비해 이쪽은 lot 단위로 쪼개져 있고,
+    출고 시트에 아예 빠진 거래처(한국전자판매·크래비스 등)까지 들어 있다.
+    실측: 겹치는 기간에 출고 시트 4,959행 / 6,104만EA 대 이 시트 89,128행 / 9.7억EA.
+    """
+    cols, out = {}, []
+    for r in ws.iter_rows(values_only=True):
+        if not r:
+            continue
+        keys = {_hkey(c) for c in r if clean(c)}
+        if {"DATE", "CUSTOMER", "PART#"} <= keys:       # 헤더행
+            cols = {_hkey(h): i for i, h in enumerate(r) if clean(h)}
+            continue
+        if not cols:
+            continue
+
+        def raw(k):
+            i = cols.get(k)
+            return r[i] if i is not None and i < len(r) else None
+
+        def col(k):
+            return clean(raw(k))
+
+        date, part = norm_date(raw("DATE")), col("PART#")
+        if not date or not part:
+            continue
+        lot, dc = col("LOTNUMBER"), col("DATECODE")
+        out.append(dict(
+            date=date, part=part, customer=col("CUSTOMER"),
+            qty=to_num(raw("QTY")), sales=norm_sales(col("SALES")),
+            # '.' 은 '해당 없음' 표기로 쓰이고 있어서 빈 값으로 본다
+            lot="" if lot == "." else lot, dcode="" if dc == "." else dc,
+            doc="", mcode="", remark="", fab="",
+        ))
+    return out
+
+
 def log_day(office, date):
     """누적 이력에서 하루치를 꺼내 하루 보기와 똑같은 모양으로 만든다.
 
     업로드한 파일의 날짜 시트는 오늘·어제뿐이라, 그보다 과거를 하루 보기로 열려면
     DB 에서 되살려야 한다. day_block() 을 그대로 써서 KPI·차트·요약이 같은 계산을 탄다.
     """
-    where, args = ["date=?"], [date]
-    if office and office != ALL:
-        where.append("slug=?"); args.append(office_slug(office))
-    sql = " AND ".join(where)
+    sc, sargs = log_scope(office)
+    args = [date] + sargs
+    sql = "date=? AND " + sc
     cx = log_conn()
     try:
         rows = {"in": [], "out": []}
-        for d, cust, part, qty, sales, doc, remark, fab in cx.execute(
-                f"SELECT dir,customer,part,qty,sales,doc,remark,fab FROM log WHERE {sql}", args):
+        for d, cust, part, qty, sales, doc, remark, fab, lot, dc in cx.execute(
+                f"SELECT dir,customer,part,qty,sales,doc,remark,fab,lot,dcode "
+                f"FROM log WHERE {sql}", args):
             rows[d].append(dict(customer=cust, part=part, qty=qty, sales=sales,
-                                doc=doc, remark=remark, fab=fab, vendor=""))
+                                doc=doc, remark=remark, fab=fab, vendor="",
+                                lot=lot or "", dcode=dc or ""))
         # 비교 기준이 될 직전 영업일 (달력상 전날이 아니라 '자료가 있는 전날')
-        prev = cx.execute(f"SELECT MAX(date) FROM log WHERE date<? AND "
-                          f"{sql.replace('date=?', '1=1')}", [date] + args[1:]).fetchone()[0]
+        prev = cx.execute(f"SELECT MAX(date) FROM log WHERE date<? AND {sc}",
+                          [date] + sargs).fetchone()[0]
     finally:
         cx.close()
     return day_block(date, rows["in"], rows["out"]), prev
@@ -415,10 +495,7 @@ def log_day(office, date):
 
 def log_dates(office, limit=400):
     """그 실에 자료가 있는 날짜 목록 (최근 순). 하루 보기 달력의 선택지."""
-    where, args = [], []
-    if office and office != ALL:
-        where.append("slug=?"); args.append(office_slug(office))
-    sql = " AND ".join(where) or "1=1"
+    sql, args = log_scope(office)
     cx = log_conn()
     try:
         return [d for (d,) in cx.execute(
@@ -432,11 +509,15 @@ def log_span(office=None):
     """그 실의 이력이 언제부터 언제까지 있는지 — 달력 입력의 범위로 쓴다."""
     cx = log_conn()
     try:
-        if office and office != ALL:
+        if office == LEDGER:
+            row = cx.execute("SELECT MIN(date),MAX(date),COUNT(*) FROM log "
+                             "WHERE slug=?", (LEDGER_SLUG,)).fetchone()
+        elif office and office != ALL:
             row = cx.execute("SELECT MIN(date),MAX(date),COUNT(*) FROM log "
                              "WHERE slug=?", (office_slug(office),)).fetchone()
         else:
-            row = cx.execute("SELECT MIN(date),MAX(date),COUNT(*) FROM log").fetchone()
+            row = cx.execute("SELECT MIN(date),MAX(date),COUNT(*) FROM log "
+                             "WHERE slug<>?", (LEDGER_SLUG,)).fetchone()
     finally:
         cx.close()
     return dict(min=row[0] or "", max=row[1] or "", rows=row[2] or 0)
@@ -697,7 +778,9 @@ def day_block(date, inbound, outbound):
         in_rows=[dict(part=r["part"], qty=round(r["qty"]), customer=r["customer"],
                       sales=r["sales"], fab=r["fab"], remark=r["remark"]) for r in inbound],
         out_rows=[dict(customer=r["customer"], part=r["part"], qty=round(r["qty"]),
-                       sales=r["sales"], doc=r["doc"], remark=r["remark"], vendor=r["vendor"]) for r in outbound],
+                       sales=r["sales"], doc=r.get("doc", ""), remark=r.get("remark", ""),
+                       vendor=r.get("vendor", ""), lot=r.get("lot", ""),
+                       dcode=r.get("dcode", "")) for r in outbound],
     )
 
 
@@ -807,6 +890,7 @@ def build_payload(files, password):
     raw_offices, inventories = [], {}     # [(실이름, {날짜:(inb,outb)})]
     logs = {}                             # 실이름 → {'in': [...], 'out': [...]} 누적 이력
     ships = []                            # 선적 리포트 행 (PO# → 발주업체)
+    shipmgmt = []                         # 전사 출고 원장 (shipping management, lot 단위)
     for f in files:
         name = f.get("name") or "실"
         wb = open_wb(decode_upload(f["file"]), password)
@@ -822,6 +906,15 @@ def build_payload(files, password):
                 inv = parse_inventory(ws)
                 if inv:
                     inventories[name] = inv
+                    # 재고 파일마다 들어 있는 'shipping management' 는 실별 시트가 아니라
+                    # 전사 공용 출고 원장의 스냅샷이다 (실측: 파일 간 행 단위 99.4~99.8% 동일,
+                    # lot 95.5%가 3개 실에 중복). 실별로 담으면 같은 출고가 3번 계산되므로
+                    # 실 구분 없이 한 벌만 유지한다. 같은 날짜를 여러 파일이 갖고 있으면
+                    # 마지막에 올린 파일이 그 날짜를 차지한다 — 시트에 스냅샷 시점이 없어
+                    # 어느 쪽이 최신인지 알 수 없다. 파일 간 차이가 0.6% 미만이라 실무상 무해.
+                    sm = shipmgmt_sheet(wb)
+                    if sm is not None:
+                        shipmgmt.extend(parse_shipmgmt(sm))
                     continue
             ws = shipping_sheet(wb)                     # 선적 리포트 (PO# → 발주업체)
             if ws is not None:
@@ -847,6 +940,8 @@ def build_payload(files, password):
         for rows in by_dir.values():
             for r in rows:
                 C.add(r.get("customer"))
+    for r in shipmgmt:
+        C.add(r.get("customer"))
     for inv in inventories.values():
         for it in inv["items"]:
             C.add(it.get("customer"))
@@ -860,6 +955,10 @@ def build_payload(files, password):
             for r in rows:
                 r["customer"] = C.canon(r.get("customer"))
         log_store(name, by_dir)
+    if shipmgmt:
+        for r in shipmgmt:
+            r["customer"] = C.canon(r.get("customer"))
+        log_store(LEDGER, {"out": shipmgmt}, src="sm")
     for inv in inventories.values():
         bk = defaultdict(float)
         for it in inv["items"]:
@@ -885,6 +984,7 @@ def build_payload(files, password):
 
     # 실별 이력 보유 구간 — 기간 입력의 min/max 로 쓴다 (행 자체는 서버가 들고 있다)
     spans = {o["name"]: log_span(o["name"]) for o in offices}
+    spans[LEDGER] = log_span(LEDGER)                # 전사 출고 원장 (실 소속 없음)
     return dict(offices=offices, inventories=inventories, spans=spans)
 
 
@@ -986,11 +1086,12 @@ def export_xlsx(payload):
                ["순물동(입-출)", res["net"]], ["출고 거래처", res["out"]["customers"]]],
               widths=[20, 30])
         sheet("출고", f"출고 이력 · {office} · {span}",
-              ["#", "일자", "거래처", "PART#", "수량", "담당", "문서번호", "비고"],
+              ["#", "일자", "거래처", "PART#", "수량", "담당", "lot number", "DATECODE",
+               "문서번호", "비고"],
               [[i + 1, r["date"], r["customer"], r["part"], r["qty"],
-                r["sales"], r["doc"], r["remark"]]
+                r["sales"], r["lot"], r["dcode"], r["doc"], r["remark"]]
                for i, r in enumerate(res["out"]["rows"])],
-              widths=[6, 13, 22, 26, 12, 10, 16, 22])
+              widths=[6, 13, 22, 26, 12, 10, 22, 12, 16, 22])
         sheet("입고", f"입고 이력 · {office} · {span}",
               ["#", "일자", "거래처/공급", "PART#", "수량", "담당", "SR#", "FAB", "비고"],
               [[i + 1, r["date"], r["customer"], r["part"], r["qty"],
@@ -1007,11 +1108,13 @@ def export_xlsx(payload):
                ["순물동(입-출)", k.get("net")], ["출고 거래처", k.get("customers")]],
               widths=[20, 16])
         sheet("출고", f"출고 내역 · {office} · {day.get('date','')}",
-              ["#", "거래처", "PART#", "수량", "담당", "문서번호", "비고"],
+              ["#", "거래처", "PART#", "수량", "담당", "lot number", "DATECODE",
+               "문서번호", "비고"],
               [[i + 1, r.get("customer"), r.get("part"), r.get("qty"),
-                r.get("sales"), r.get("doc"), r.get("remark")]
+                r.get("sales"), r.get("lot", ""), r.get("dcode", ""),
+                r.get("doc"), r.get("remark")]
                for i, r in enumerate(day.get("out_rows", []))],
-              widths=[6, 22, 26, 12, 10, 16, 22])
+              widths=[6, 22, 26, 12, 10, 22, 12, 16, 22])
         sheet("입고", f"입고 내역 · {office} · {day.get('date','')}",
               ["#", "거래처/공급", "PART#", "수량", "담당", "FAB", "비고"],
               [[i + 1, r.get("customer"), r.get("part"), r.get("qty"),
@@ -1452,7 +1555,13 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         with open(DATA_FILE, encoding="utf-8") as f:
                             prev = json.load(f)
+                        # 이력이 늘었을 수 있으니 보유 구간은 다시 계산해 준다
+                        prev["spans"] = {o["name"]: log_span(o["name"])
+                                         for o in prev.get("offices", [])}
                         result = {**prev, "ship_only": True}
+                        with open(DATA_FILE, "w", encoding="utf-8") as f:
+                            json.dump({k: v for k, v in result.items()
+                                       if k != "ship_only"}, f, ensure_ascii=False)
                     except Exception:
                         pass
                 else:
@@ -1713,6 +1822,7 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       <div class="viewseg">
         <button class="on" id="vw-io" onclick="showView('io')">📦 일일 입출고</button>
         <button id="vw-inv" onclick="showView('inv')">📊 재고 현황</button>
+        <button id="vw-sm" onclick="showView('sm')">📋 전체 출고 원장</button>
       </div>
       <button id="btn-xls" class="xlsbtn" onclick="exportXlsx()">⬇ Excel 내보내기</button>
     </div>
@@ -1819,6 +1929,35 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     </div>
     <div class="foot" id="inv-foot"></div>
   </div>
+
+  <!-- ============ 전체 출고 원장 (shipping management) ============
+       전사 공용 원장이라 실 구분이 없다. 실별 입출고와 섞지 않고 따로 본다. -->
+  <div class="wrap" id="smview" style="display:none">
+    <div class="logbar" id="sm-bar">
+      <span class="lab">기간</span>
+      <span class="dpair"><input type="date" id="sm-from"><span class="tilde">~</span><input type="date" id="sm-to"></span>
+      <button class="pre" data-k="m"   onclick="smPreset('m')">이번달</button>
+      <button class="pre" data-k="m3"  onclick="smPreset('m3')">3개월</button>
+      <button class="pre" data-k="y"   onclick="smPreset('y')">올해</button>
+      <button class="pre on" data-k="all" onclick="smPreset('all')">전체</button>
+      <div class="note" id="sm-note"></div>
+    </div>
+    <div class="kpis" id="sm-kpis"></div>
+    <div class="tablewrap">
+      <div class="srch" id="sm-srch">
+        <select class="fsel" id="sm-f1"></select>
+        <input class="fval" id="sm-v1" placeholder="값 입력…">
+        <span class="andlab">AND</span>
+        <select class="fsel" id="sm-f2"></select>
+        <input class="fval" id="sm-v2" placeholder="값 입력…">
+        <button class="go" onclick="runSm()">조회</button>
+        <button class="off" onclick="clearSmSearch()">초기화</button>
+        <span class="hit" id="sm-hit"></span>
+      </div>
+      <div class="scroll" id="sm-table"></div>
+    </div>
+    <div class="foot" id="sm-foot"></div>
+  </div>
 </div>
 
 <script>
@@ -1916,9 +2055,15 @@ function renderApp(){
   if(!INVNAMES.length && !slug) INVNAMES=Object.keys(INVS).slice(0,1);   // 재고만 올린 경우
   const hasInv=INVNAMES.length>0;
 
-  document.getElementById('viewnav').style.display=(hasIO||hasInv)?'block':'none';
+  // 전사 출고 원장은 재고 파일을 올렸을 때만 생긴다 (shipping management 시트)
+  SMSPAN=(DATA.spans||{})[LEDGER]||{min:'',max:'',rows:0};
+  const hasSm=SMSPAN.rows>0;
+  if(hasSm) initSmBar();
+
+  document.getElementById('viewnav').style.display=(hasIO||hasInv||hasSm)?'block':'none';
   document.getElementById('vw-io').style.display=hasIO?'':'none';
   document.getElementById('vw-inv').style.display=hasInv?'':'none';
+  document.getElementById('vw-sm').style.display=hasSm?'':'none';
 
   // 발주업체 표를 먼저 받아 두고 재고를 그린다 (없으면 PO# 칼럼만 나오고 그대로 동작)
   if(hasInv){ INVK=INVNAMES[0]; loadPoMap().then(renderInventory); }
@@ -1926,18 +2071,19 @@ function renderApp(){
 }
 
 function showView(v){
-  const io=v==='io';
-  VIEW=io?'io':'inv';
-  document.getElementById('ioview').style.display=io?'block':'none';
-  document.getElementById('invview').style.display=io?'none':'block';
-  document.getElementById('vw-io').classList.toggle('on',io);
-  document.getElementById('vw-inv').classList.toggle('on',!io);
-  if(!io){
+  VIEW=v;
+  document.getElementById('ioview').style.display =v==='io' ?'block':'none';
+  document.getElementById('invview').style.display=v==='inv'?'block':'none';
+  document.getElementById('smview').style.display =v==='sm' ?'block':'none';
+  ['io','inv','sm'].forEach(k=>document.getElementById('vw-'+k).classList.toggle('on',k===v));
+  if(v==='inv'){
     const I=INVS[INVK];
     if(!I) return;
     document.getElementById('h-date').innerHTML=`재고 현황 <span class="d">·</span> ${esc(INVK)}`;
     document.getElementById('h-meta').textContent=
       `품목 ${fmt(I.n_items)}건 · 총 재고 ${fmt(I.total_qty)} EA`;
+  }else if(v==='sm'){
+    SMRES ? renderSm() : runSm();
   }else if(O){ LOGMODE&&LOGRES ? renderLog() : showDay(CUR); }   // 기간 조회 중이었으면 그대로 복귀
 }
 
@@ -1946,10 +2092,13 @@ function exportXlsx(){
   const b=document.getElementById('btn-xls');
   const body = VIEW==='inv'
     ? {office:INVK, view:'inv', inventory:INVS[INVK]}
-    : LOGMODE                                   // 기간 조회는 화면 상한과 무관하게 전체가 나간다
-      ? {office:O.name, view:'log', ...LOGARGS}
-      : {office:O.name, view:'io', day:CURDAY||O.days[CUR]};
+    : VIEW==='sm'
+      ? {office:LEDGER, view:'log', ...SMARGS}
+      : LOGMODE                                 // 기간 조회는 화면 상한과 무관하게 전체가 나간다
+        ? {office:O.name, view:'log', ...LOGARGS}
+        : {office:O.name, view:'io', day:CURDAY||O.days[CUR]};
   const label = VIEW==='inv' ? `재고_${INVK}`
+    : VIEW==='sm' ? `출고원장_${SMARGS.from||'처음'}_${SMARGS.to||'끝'}`
     : LOGMODE ? `입출고이력_${O.name}_${LOGARGS.from||'처음'}_${LOGARGS.to||'끝'}`
     : `입출고_${O.name}_${(CURDAY||O.days[CUR]).date}`;
   b.disabled=true; b.textContent='⏳ 만드는 중…';
@@ -2158,7 +2307,9 @@ function buildSummary(day, prev, tag){
 function emptyMsg(){return '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">이 날짜의 내역이 없습니다</div>';}
 function noHit(){return '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조건에 맞는 내역이 없습니다</div>';}
 
-const IO_ALL=r=>[r.customer,r.part,r.sales,r.doc,r.remark,r.fab];
+const IO_ALL=r=>[r.customer,r.part,r.sales,r.doc,r.remark,r.fab,r.lot,r.dcode];
+// lot·DATECODE 는 shipping management 에서만 오므로, 있는 날짜에서만 칼럼을 띄운다
+const hasLot=rows=>rows.some(r=>r.lot||r.dcode);
 let DSORT={k:'',d:0};                      // 하루 보기 정렬 (기본 = 엑셀 순서)
 let CURDAY=null;                           // 지금 보고 있는 하루 (파일의 날짜일 수도, 달력으로 고른 과거일 수도)
 
@@ -2176,10 +2327,12 @@ function buildTables(day){
 
   const S=(l,k,c)=>th(l,k,DSORT,'sortDay',c);
   const empty=day.out_rows.length||day.in_rows.length?noHit():emptyMsg();
-  const out=!outR.length?empty:`<table><thead><tr><th>#</th>${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
+  const L=hasLot(day.out_rows);
+  const out=!outR.length?empty:`<table><thead><tr><th>#</th>${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
     outR.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
       <td class="qty">${fmt(r.qty)}</td><td>${esc(r.sales)}</td>
-      <td>${esc(r.doc)||'—'}</td><td style="color:#888">${esc(r.remark)||''}</td></tr>`).join('')}</tbody></table>`;
+      ${L?`<td class="po">${esc(r.lot)||'—'}</td><td class="dt">${esc(r.dcode)||'—'}</td>`
+        :`<td>${esc(r.doc)||'—'}</td>`}<td style="color:#888">${esc(r.remark)||''}</td></tr>`).join('')}</tbody></table>`;
   const inn=!inR.length?empty:`<table><thead><tr><th>#</th>${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}</tr></thead><tbody>${
     inR.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
       <td class="qty">${fmt(r.qty)}</td><td>${esc(r.sales)}</td><td>${esc(r.fab)?'<span class="pill">FAB '+esc(r.fab)+'</span>':'—'}</td>
@@ -2205,7 +2358,8 @@ function showTab(which){
 // 정렬은 헤더 클릭으로 오름 → 내림 → 기본 순환. 기간 조회만 서버가 정렬하는데,
 // 3,000행 상한이 걸린 뒤 화면에서 정렬하면 그 3,000행 안에서만 섞이기 때문이다.
 const F_IO =[['all','전체'],['customer','거래처'],['part','PART#'],
-             ['sales','담당'],['doc','문서번호'],['remark','비고']];
+             ['sales','담당'],['lot','lot number'],['dcode','DATECODE'],
+             ['doc','문서번호'],['remark','비고']];
 const F_INV=[['all','전체'],['part','PART#'],['customer','PO# / 고객'],['buyer','발주업체'],
              ['mobis','MOBIS ID'],['family','FAMILY'],['sales','담당'],['office','실']];
 
@@ -2347,13 +2501,15 @@ function renderLog(){
   const cap=s=>s.truncated?`<div class="trunc">전체 ${fmt(s.cnt)}건 중 ${fmt(s.shown)}건만 표시합니다 —
     기간을 좁히거나 검색 조건을 넣어 보세요. <b>⬇ Excel 내보내기는 전체가 나갑니다.</b></div>`:'';
   const S=(l,k,c)=>th(l,k,LSORT,'sortLog',c);
+  const L=hasLot(r.out.rows);
 
   TB={
-    out: !r.out.rows.length?none:cap(r.out)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
+    out: !r.out.rows.length?none:cap(r.out)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
       r.out.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
         <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
         <td class="qty">${fmt(x.qty)}</td><td>${esc(x.sales)}</td>
-        <td>${esc(x.doc)||'—'}</td><td style="color:#888">${esc(x.remark)||''}</td></tr>`).join('')}</tbody></table>`,
+        ${L?`<td class="po">${esc(x.lot)||'—'}</td><td class="dt">${esc(x.dcode)||'—'}</td>`
+          :`<td>${esc(x.doc)||'—'}</td>`}<td style="color:#888">${esc(x.remark)||''}</td></tr>`).join('')}</tbody></table>`,
     in: !r.in.rows.length?none:cap(r.in)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}</tr></thead><tbody>${
       r.in.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
         <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
@@ -2377,6 +2533,24 @@ function exitLog(){ LSORT={k:'',d:0}; showDay(CUR); }
 document.addEventListener('DOMContentLoaded',()=>{
   fillFields('io', F_IO, 'all', 'part');
   fillFields('inv', F_INV, 'all', 'part');
+  fillFields('sm', F_IO, 'all', 'part');
+  ['sm-v1','sm-v2'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(!el) return;
+    el.addEventListener('input',()=>{ clearTimeout(SMTMR); SMTMR=setTimeout(runSm,350); });
+    el.addEventListener('keydown',e=>{ if(e.key==='Enter'){ clearTimeout(SMTMR); runSm(); } });
+  });
+  ['sm-f1','sm-f2'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('change',runSm);
+  });
+  ['sm-from','sm-to'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('change',()=>{
+      document.querySelectorAll('#sm-bar .pre').forEach(b=>b.classList.remove('on'));
+      runSm();
+    });
+  });
   // 타이핑이 멎으면 자동 조회 — 조회 버튼을 누르지 않아도 되게
   ['io-v1','io-v2'].forEach(id=>{
     const el=document.getElementById(id);
@@ -2406,6 +2580,83 @@ document.addEventListener('DOMContentLoaded',()=>{
     });
   });
 });
+
+// ================= 전체 출고 원장 (shipping management) =================
+// 전사 공용 원장이라 실 소속이 없다. 서버는 office=LEDGER 로 이 범위만 조회한다.
+const LEDGER='전체 출고 원장';
+let SMSORT={k:'',d:0}, SMSPAN={min:'',max:'',rows:0}, SMRES=null, SMARGS=null, SMTMR=null;
+
+function sortSm(key){ nextDir(SMSORT,key); runSm(); }
+function clearSmSearch(){ clearFields('sm'); runSm(); }
+
+function initSmBar(){
+  const f=document.getElementById('sm-from'), t=document.getElementById('sm-to');
+  f.min=t.min=SMSPAN.min; f.max=t.max=SMSPAN.max;
+  document.getElementById('sm-note').textContent=
+    `원장 ${SMSPAN.min} ~ ${SMSPAN.max} · ${fmt(SMSPAN.rows)}행 · lot 단위 출고 내역 (재고 파일의 shipping management 시트)`;
+  smPreset('all', true);
+}
+function smPreset(kind, quiet){
+  const end=SMSPAN.max||'', start=
+    kind==='m' ? end.slice(0,8)+'01' :
+    kind==='m3'? isoAdd(end,-90) :
+    kind==='y' ? end.slice(0,4)+'-01-01' : (SMSPAN.min||end);
+  document.getElementById('sm-from').value=(SMSPAN.min&&start<SMSPAN.min)?SMSPAN.min:start;
+  document.getElementById('sm-to').value=end;
+  document.querySelectorAll('#sm-bar .pre').forEach(b=>b.classList.toggle('on',b.dataset.k===kind));
+  if(!quiet) runSm();
+}
+
+function runSm(){
+  const from=document.getElementById('sm-from').value,
+        to  =document.getElementById('sm-to').value,
+        conds=condsOf('sm');
+  if(from && to && from>to){
+    document.getElementById('sm-table').innerHTML=
+      '<div style="padding:40px;text-align:center;color:var(--red);font-size:13px">시작일이 종료일보다 뒤입니다</div>';
+    return;
+  }
+  const sort=SMSORT.d?SMSORT.k:'date', dir=SMSORT.d>0?'asc':'desc';
+  SMARGS={from,to,conds,sort,dir};
+  document.getElementById('sm-table').innerHTML=
+    '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조회 중…</div>';
+  const p=new URLSearchParams({office:LEDGER, from, to, sort, dir});
+  conds.forEach((c,i)=>{ p.set('f'+(i+1),c.f); p.set('v'+(i+1),c.v); });
+  fetch('/log?'+p.toString()).then(r=>r.json()).then(res=>{
+    if(res.error) throw new Error(res.error);
+    SMRES=res; renderSm();
+  }).catch(e=>{
+    document.getElementById('sm-table').innerHTML=
+      `<div style="padding:40px;text-align:center;color:var(--red);font-size:13px">조회 실패 — ${esc(e.message)}</div>`;
+  });
+}
+
+function renderSm(){
+  const o=SMRES.out, {from,to,conds}=SMARGS;
+  const q=conds.map(c=>`${(F_IO.find(f=>f[0]===c.f)||['','전체'])[1]}='${c.v}'`).join(' AND ');
+  document.getElementById('h-date').innerHTML=
+    `전체 출고 원장 <span class="d">·</span> ${esc(from||'처음')} ~ ${esc(to||'끝')}`;
+  document.getElementById('h-meta').textContent=
+    `${q?q+' · ':''}출고 ${fmt(o.cnt)}건 / ${fmt(o.qty)} EA · 거래처 ${fmt(o.customers)}곳`;
+  document.getElementById('sm-kpis').innerHTML=[
+    ['out','출고 건수',o.cnt,'건'],['out','출고 수량',o.qty,'EA'],['cu','거래처',o.customers,'곳'],
+  ].map(([c,l,v,u])=>`<div class="kpi ${c}"><div class="l">${l}</div>
+     <div class="v tab">${fmt(v)}<span class="u">${u}</span></div><span class="d fl">&nbsp;</span></div>`).join('');
+  document.getElementById('sm-hit').textContent=conds.length?`${fmt(o.cnt)}건`:'';
+
+  const S=(l,k,c)=>th(l,k,SMSORT,'sortSm',c);
+  const cap=o.truncated?`<div class="trunc">전체 ${fmt(o.cnt)}건 중 ${fmt(o.shown)}건만 표시합니다 —
+    기간을 좁히거나 검색 조건을 넣어 보세요. <b>⬇ Excel 내보내기는 전체가 나갑니다.</b></div>`:'';
+  document.getElementById('sm-table').innerHTML = !o.rows.length
+    ? '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조건에 맞는 내역이 없습니다</div>'
+    : cap+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('lot number','lot')}${S('DATECODE','dcode')}</tr></thead><tbody>${
+      o.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
+        <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
+        <td class="qty">${fmt(x.qty)}</td><td>${esc(x.sales)||'—'}</td>
+        <td class="po">${esc(x.lot)||'—'}</td><td class="dt">${esc(x.dcode)||'—'}</td></tr>`).join('')}</tbody></table>`;
+  document.getElementById('sm-foot').textContent=
+    '자료: 재고 파일의 shipping management 시트 · 전사 공용 원장이라 영업실 구분이 없습니다';
+}
 
 // ================= 재고 현황 =================
 let ICH={}, ITAB='all';
