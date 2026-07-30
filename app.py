@@ -168,6 +168,8 @@ def parse_daily(ws):
             outbound.append(dict(
                 customer=col("CUSTOMER"), part=part, qty=qty, sales=sales,
                 doc=col("문서번호", "DOC"), remark=col("REMARK"), vendor=col("VENDOR"),
+                # 운송장번호는 날짜 시트에만 있다 (누적 '출고' 시트에는 이 칸이 없음)
+                waybill=col("운송장번호", "운송장", "WAYBILL", "TRACKINGNUMBER"),
             ))
     return inbound, outbound
 
@@ -272,7 +274,7 @@ def log_conn():
     # src: 이 행이 어느 시트에서 왔나. 'sm'(shipping management) 이 'sheet'(누적 출고) 를 이긴다.
     # 같은 출고를 두 시트가 다르게 적고 있어서(누적=주문 단위, sm=lot 단위) 우선순위가 없으면
     # 마지막에 올린 파일이 이기는 비결정적 동작이 된다.
-    for col in ("src", "lot", "dcode"):
+    for col in ("src", "lot", "dcode", "waybill"):
         if col not in {r[1] for r in cx.execute("PRAGMA table_info(log)")}:
             cx.execute(f"ALTER TABLE log ADD COLUMN {col} TEXT")
             if col == "src":
@@ -330,11 +332,13 @@ def log_store(office, by_dir, src="sheet"):
                            % ",".join("?" * len(chunk)), [slug, d] + chunk)
             rows = [(office, slug, d, r["date"], r["customer"], r["part"], r["qty"],
                      r["sales"], r.get("doc", ""), r.get("mcode", ""), r.get("remark", ""),
-                     r.get("fab", ""), src, r.get("lot", ""), r.get("dcode", ""))
+                     r.get("fab", ""), src, r.get("lot", ""), r.get("dcode", ""),
+                     r.get("waybill", ""))
                     for r in rs]
             cx.executemany(
                 "INSERT INTO log(office,slug,dir,date,customer,part,qty,sales,doc,mcode,"
-                "remark,fab,src,lot,dcode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                "remark,fab,src,lot,dcode,waybill) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             total += len(rows)
         # 같은 실을 다른 이름으로 올린 적이 있으면 표시 이름만 최신으로 맞춘다
         cx.execute("UPDATE log SET office=? WHERE slug=? AND office<>?", (office, slug, office))
@@ -348,12 +352,13 @@ def log_store(office, by_dir, src="sheet"):
 # (정렬 키가 SQL 에 그대로 들어가므로 화이트리스트가 곧 주입 차단이다).
 LOG_FIELDS = {"customer": "customer", "part": "part", "sales": "sales",
               "doc": "doc", "mcode": "mcode", "remark": "remark", "date": "date",
-              "fab": "fab", "lot": "lot", "dcode": "dcode"}
-LOG_ALL_COLS = ["customer", "part", "sales", "doc", "mcode", "remark", "lot", "dcode"]
+              "fab": "fab", "lot": "lot", "dcode": "dcode", "waybill": "waybill"}
+LOG_ALL_COLS = ["customer", "part", "sales", "doc", "mcode", "remark", "lot", "dcode",
+                "waybill"]
 LOG_SORTS = dict(LOG_FIELDS, qty="qty")
 FIELD_KO = {"customer": "거래처", "part": "PART#", "sales": "담당",
             "doc": "문서번호", "mcode": "Material Code", "remark": "비고", "date": "일자",
-            "lot": "lot number", "dcode": "DATECODE"}
+            "lot": "lot number", "dcode": "DATECODE", "waybill": "운송장번호"}
 
 
 def log_scope(office):
@@ -406,9 +411,11 @@ def log_query(office, dfrom, dto, conds, sort="date", direction="desc",
                 f"SELECT COUNT(*),COALESCE(SUM(qty),0),COUNT(DISTINCT customer) "
                 f"FROM log WHERE dir=? AND {sql}", [d] + args).fetchone()
             rows = [dict(date=a, customer=b, part=c, qty=round(e), sales=f,
-                         doc=g, mcode=h, remark=i, fab=j, lot=k or "", dcode=l or "")
-                    for a, b, c, e, f, g, h, i, j, k, l in cx.execute(
-                        f"SELECT date,customer,part,qty,sales,doc,mcode,remark,fab,lot,dcode "
+                         doc=g, mcode=h, remark=i, fab=j, lot=k or "", dcode=l or "",
+                         waybill=m or "")
+                    for a, b, c, e, f, g, h, i, j, k, l, m in cx.execute(
+                        f"SELECT date,customer,part,qty,sales,doc,mcode,remark,fab,lot,"
+                        f"dcode,waybill "
                         f"FROM log WHERE dir=? AND {sql} ORDER BY {order} "
                         f"LIMIT ?", [d] + args + [limit])]
             out[d] = dict(cnt=cnt, qty=round(qty), customers=custs,
@@ -479,12 +486,12 @@ def log_day(office, date):
     cx = log_conn()
     try:
         rows = {"in": [], "out": []}
-        for d, cust, part, qty, sales, doc, remark, fab, lot, dc in cx.execute(
-                f"SELECT dir,customer,part,qty,sales,doc,remark,fab,lot,dcode "
+        for d, cust, part, qty, sales, doc, remark, fab, lot, dc, wb_ in cx.execute(
+                f"SELECT dir,customer,part,qty,sales,doc,remark,fab,lot,dcode,waybill "
                 f"FROM log WHERE {sql}", args):
             rows[d].append(dict(customer=cust, part=part, qty=qty, sales=sales,
                                 doc=doc, remark=remark, fab=fab, vendor="",
-                                lot=lot or "", dcode=dc or ""))
+                                lot=lot or "", dcode=dc or "", waybill=wb_ or ""))
         # 비교 기준이 될 직전 영업일 (달력상 전날이 아니라 '자료가 있는 전날')
         prev = cx.execute(f"SELECT MAX(date) FROM log WHERE date<? AND {sc}",
                           [date] + sargs).fetchone()[0]
@@ -780,7 +787,8 @@ def day_block(date, inbound, outbound):
         out_rows=[dict(customer=r["customer"], part=r["part"], qty=round(r["qty"]),
                        sales=r["sales"], doc=r.get("doc", ""), remark=r.get("remark", ""),
                        vendor=r.get("vendor", ""), lot=r.get("lot", ""),
-                       dcode=r.get("dcode", "")) for r in outbound],
+                       dcode=r.get("dcode", ""), waybill=r.get("waybill", ""))
+                  for r in outbound],
     )
 
 
@@ -1087,11 +1095,11 @@ def export_xlsx(payload):
               widths=[20, 30])
         sheet("출고", f"출고 이력 · {office} · {span}",
               ["#", "일자", "거래처", "PART#", "수량", "담당", "lot number", "DATECODE",
-               "문서번호", "비고"],
+               "운송장번호", "문서번호", "비고"],
               [[i + 1, r["date"], r["customer"], r["part"], r["qty"],
-                r["sales"], r["lot"], r["dcode"], r["doc"], r["remark"]]
+                r["sales"], r["lot"], r["dcode"], r["waybill"], r["doc"], r["remark"]]
                for i, r in enumerate(res["out"]["rows"])],
-              widths=[6, 13, 22, 26, 12, 10, 22, 12, 16, 22])
+              widths=[6, 13, 22, 26, 12, 10, 22, 12, 18, 16, 22])
         sheet("입고", f"입고 이력 · {office} · {span}",
               ["#", "일자", "거래처/공급", "PART#", "수량", "담당", "SR#", "FAB", "비고"],
               [[i + 1, r["date"], r["customer"], r["part"], r["qty"],
@@ -1109,12 +1117,12 @@ def export_xlsx(payload):
               widths=[20, 16])
         sheet("출고", f"출고 내역 · {office} · {day.get('date','')}",
               ["#", "거래처", "PART#", "수량", "담당", "lot number", "DATECODE",
-               "문서번호", "비고"],
+               "운송장번호", "문서번호", "비고"],
               [[i + 1, r.get("customer"), r.get("part"), r.get("qty"),
                 r.get("sales"), r.get("lot", ""), r.get("dcode", ""),
-                r.get("doc"), r.get("remark")]
+                r.get("waybill", ""), r.get("doc"), r.get("remark")]
                for i, r in enumerate(day.get("out_rows", []))],
-              widths=[6, 22, 26, 12, 10, 22, 12, 16, 22])
+              widths=[6, 22, 26, 12, 10, 22, 12, 18, 16, 22])
         sheet("입고", f"입고 내역 · {office} · {day.get('date','')}",
               ["#", "거래처/공급", "PART#", "수량", "담당", "FAB", "비고"],
               [[i + 1, r.get("customer"), r.get("part"), r.get("qty"),
@@ -2307,9 +2315,11 @@ function buildSummary(day, prev, tag){
 function emptyMsg(){return '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">이 날짜의 내역이 없습니다</div>';}
 function noHit(){return '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조건에 맞는 내역이 없습니다</div>';}
 
-const IO_ALL=r=>[r.customer,r.part,r.sales,r.doc,r.remark,r.fab,r.lot,r.dcode];
-// lot·DATECODE 는 shipping management 에서만 오므로, 있는 날짜에서만 칼럼을 띄운다
+const IO_ALL=r=>[r.customer,r.part,r.sales,r.doc,r.remark,r.fab,r.lot,r.dcode,r.waybill];
+// lot·DATECODE 는 shipping management 에서만, 운송장번호는 날짜 시트에서만 온다.
+// 값이 있는 표에서만 칼럼을 띄운다 — 빈 칸만 늘어놓지 않도록.
 const hasLot=rows=>rows.some(r=>r.lot||r.dcode);
+const hasWb =rows=>rows.some(r=>r.waybill);
 let DSORT={k:'',d:0};                      // 하루 보기 정렬 (기본 = 엑셀 순서)
 let CURDAY=null;                           // 지금 보고 있는 하루 (파일의 날짜일 수도, 달력으로 고른 과거일 수도)
 
@@ -2327,12 +2337,13 @@ function buildTables(day){
 
   const S=(l,k,c)=>th(l,k,DSORT,'sortDay',c);
   const empty=day.out_rows.length||day.in_rows.length?noHit():emptyMsg();
-  const L=hasLot(day.out_rows);
-  const out=!outR.length?empty:`<table><thead><tr><th>#</th>${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
+  const L=hasLot(day.out_rows), W=hasWb(day.out_rows);
+  const out=!outR.length?empty:`<table><thead><tr><th>#</th>${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):''}${W?S('운송장번호','waybill'):''}${L?'':S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
     outR.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
       <td class="qty">${fmt(r.qty)}</td><td>${esc(r.sales)}</td>
-      ${L?`<td class="po">${esc(r.lot)||'—'}</td><td class="dt">${esc(r.dcode)||'—'}</td>`
-        :`<td>${esc(r.doc)||'—'}</td>`}<td style="color:#888">${esc(r.remark)||''}</td></tr>`).join('')}</tbody></table>`;
+      ${L?`<td class="po">${esc(r.lot)||'—'}</td><td class="dt">${esc(r.dcode)||'—'}</td>`:''}
+      ${W?`<td class="po">${esc(r.waybill)||'—'}</td>`:''}
+      ${L?'':`<td>${esc(r.doc)||'—'}</td>`}<td style="color:#888">${esc(r.remark)||''}</td></tr>`).join('')}</tbody></table>`;
   const inn=!inR.length?empty:`<table><thead><tr><th>#</th>${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}</tr></thead><tbody>${
     inR.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
       <td class="qty">${fmt(r.qty)}</td><td>${esc(r.sales)}</td><td>${esc(r.fab)?'<span class="pill">FAB '+esc(r.fab)+'</span>':'—'}</td>
@@ -2358,8 +2369,8 @@ function showTab(which){
 // 정렬은 헤더 클릭으로 오름 → 내림 → 기본 순환. 기간 조회만 서버가 정렬하는데,
 // 3,000행 상한이 걸린 뒤 화면에서 정렬하면 그 3,000행 안에서만 섞이기 때문이다.
 const F_IO =[['all','전체'],['customer','거래처'],['part','PART#'],
-             ['sales','담당'],['lot','lot number'],['dcode','DATECODE'],
-             ['doc','문서번호'],['remark','비고']];
+             ['sales','담당'],['waybill','운송장번호'],['doc','문서번호'],
+             ['lot','lot number'],['dcode','DATECODE'],['remark','비고']];
 const F_INV=[['all','전체'],['part','PART#'],['customer','PO# / 고객'],['buyer','발주업체'],
              ['mobis','MOBIS ID'],['family','FAMILY'],['sales','담당'],['office','실']];
 
@@ -2501,15 +2512,16 @@ function renderLog(){
   const cap=s=>s.truncated?`<div class="trunc">전체 ${fmt(s.cnt)}건 중 ${fmt(s.shown)}건만 표시합니다 —
     기간을 좁히거나 검색 조건을 넣어 보세요. <b>⬇ Excel 내보내기는 전체가 나갑니다.</b></div>`:'';
   const S=(l,k,c)=>th(l,k,LSORT,'sortLog',c);
-  const L=hasLot(r.out.rows);
+  const L=hasLot(r.out.rows), W=hasWb(r.out.rows);
 
   TB={
-    out: !r.out.rows.length?none:cap(r.out)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
+    out: !r.out.rows.length?none:cap(r.out)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):''}${W?S('운송장번호','waybill'):''}${L?'':S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
       r.out.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
         <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
         <td class="qty">${fmt(x.qty)}</td><td>${esc(x.sales)}</td>
-        ${L?`<td class="po">${esc(x.lot)||'—'}</td><td class="dt">${esc(x.dcode)||'—'}</td>`
-          :`<td>${esc(x.doc)||'—'}</td>`}<td style="color:#888">${esc(x.remark)||''}</td></tr>`).join('')}</tbody></table>`,
+        ${L?`<td class="po">${esc(x.lot)||'—'}</td><td class="dt">${esc(x.dcode)||'—'}</td>`:''}
+        ${W?`<td class="po">${esc(x.waybill)||'—'}</td>`:''}
+        ${L?'':`<td>${esc(x.doc)||'—'}</td>`}<td style="color:#888">${esc(x.remark)||''}</td></tr>`).join('')}</tbody></table>`,
     in: !r.in.rows.length?none:cap(r.in)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}</tr></thead><tbody>${
       r.in.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
         <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
