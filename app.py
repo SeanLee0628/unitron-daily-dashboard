@@ -1271,14 +1271,18 @@ def resolve_smtp(cfg):
     )
 
 
-def _send_smtp(emails, subject, body, cfg, text=None):
-    """SMTP 발송. cfg = {host, port, user, pw, sender}. text = 대체 텍스트 본문."""
+def _send_smtp(emails, subject, body, cfg, text=None, cc=None):
+    """SMTP 발송. cfg = {host, port, user, pw, sender}. text = 대체 텍스트 본문. cc = 참조."""
     import smtplib, ssl
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
     from email.utils import formataddr, formatdate, make_msgid
     host, port = cfg["host"], cfg["port"]
     user, pw, sender = cfg["user"], cfg["pw"], cfg["sender"]
+
+    # 같은 사람이 받는사람과 참조에 동시에 들어가면 메일이 두 번 간다.
+    to_keys = {e.strip().lower() for e in emails}
+    cc = [c.strip() for c in (cc or []) if c.strip() and c.strip().lower() not in to_keys]
 
     # HTML 전용 메일은 스팸 점수가 올라간다 → 텍스트 버전을 같이 보낸다
     if text:
@@ -1292,6 +1296,8 @@ def _send_smtp(emails, subject, body, cfg, text=None):
     # 메일주소 대신 이름으로 보이게 (한글은 RFC2047 로 자동 인코딩됨)
     msg["From"] = formataddr((FROM_NAME, sender)) if FROM_NAME else sender
     msg["To"] = ", ".join(emails)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
     # 답장은 발송용 계정이 아니라 문의처로 가야 한다
     msg["Reply-To"] = formataddr((CONTACT_NAME, CONTACT_MAIL))
     # Date/Message-ID 가 없는 메일은 스팸 점수가 올라간다. 지메일 릴레이는 없으면 채워주지만
@@ -1309,12 +1315,15 @@ def _send_smtp(emails, subject, body, cfg, text=None):
             pass
         if user:
             s.login(user, pw)
-        s.sendmail(sender, emails, msg.as_string())
-    return {"ok": True, "sent": True, "via": "smtp", "n": len(emails)}
+        # Cc 헤더는 표시용일 뿐이다. 실제 전달은 봉투(envelope)에 넣어야 간다.
+        s.sendmail(sender, list(emails) + cc, msg.as_string())
+    return {"ok": True, "sent": True, "via": "smtp", "n": len(emails) + len(cc), "cc": len(cc)}
 
 
-def _send_outlook(emails, subject, body, send):
+def _send_outlook(emails, subject, body, send, cc=None):
     """로컬 PC Outlook 발송(폴백)."""
+    to_keys = {e.strip().lower() for e in emails}
+    cc = [c.strip() for c in (cc or []) if c.strip() and c.strip().lower() not in to_keys]
     try:
         import pythoncom
         import win32com.client
@@ -1325,6 +1334,8 @@ def _send_outlook(emails, subject, body, send):
         app = win32com.client.Dispatch("Outlook.Application")
         mail = app.CreateItem(0)
         mail.To = "; ".join(emails)
+        if cc:
+            mail.CC = "; ".join(cc)
         mail.Subject = subject
         mail.HTMLBody = body
         if send:
@@ -1369,6 +1380,7 @@ def send_sms(numbers, text):
 def send_email(payload):
     """실 링크(+요약·내역) 이메일 발송. SMTP 설정(요청/환경변수) 있으면 SMTP, 없으면 로컬 Outlook."""
     emails = [e for e in (payload.get("emails") or []) if e]
+    cc = [e for e in (payload.get("cc") or []) if e]
     office = payload.get("office", "")
     date = payload.get("date", "")
     day = payload.get("day") or {}
@@ -1381,8 +1393,8 @@ def send_email(payload):
     if cfg:                                             # SMTP (요청 설정 또는 환경변수)
         if not emails:
             raise ValueError("받는 사람 이메일을 입력하세요.")
-        return _send_smtp(emails, subject, body, cfg, text=text)
-    return _send_outlook(emails, subject, body, payload.get("send"))  # 폴백: 로컬 Outlook
+        return _send_smtp(emails, subject, body, cfg, text=text, cc=cc)
+    return _send_outlook(emails, subject, body, payload.get("send"), cc=cc)  # 폴백: 로컬 Outlook
 
 
 # ---------------------------------------------------------------- 자동 발송 (서버)
@@ -1391,19 +1403,57 @@ def send_email(payload):
 
 # 고정 수신자. 키는 실 이름에서 뽑은 숫자 (영업5실 → '5', 영업1,2실 → '12').
 # 여기 없는 실은 DEFAULT_EMAILS 로 간다.
-# 아래 세 명(gy.choi/lindsay/hskang)은 2026-07-28 부터 전 실 공통 수신.
 # 스팸함 통과가 아직 확인 안 된 사람들이 남아 있다 — 확인되면 4·5실 수신자에 아래를 더한다:
 #   "frankie@unitrontech.com", "mh.choi@unitrontech.com", "yj.park@unitrontech.com"
 DEFAULT_EMAILS = [
     "seanlee@unitrontech.com",
-    "gy.choi@unitrontech.com",
     "lindsay@unitrontech.com",
     "hskang@unitrontech.com",
 ]
-OFFICE_EMAILS = {                          # 4·5실 자료는 자재관리팀(안성우 책임)에게도 간다
-    "4": DEFAULT_EMAILS + ["sw.ahn@unitrontech.com"],
-    "5": DEFAULT_EMAILS + ["sw.ahn@unitrontech.com"],
+
+# 전 실 참조(Cc). 2026-08-06 — 받는 사람이 아니라 참조로 간다.
+# gy.choi 는 이전까지 받는 사람이었고, sw.ahn 은 4·5실만 받았다. 둘 다 여기로 옮겼다.
+CC_EMAILS = [
+    "sw.ahn@unitrontech.com",
+    "gy.choi@unitrontech.com",
+    "bjsoh@unitrontech.com",
+]
+
+# 실 담당자. 2026-08-06 추가 — 각 실이 자기 실 자료를 직접 받는다.
+# 위 DEFAULT_EMAILS(전 실 공통 수신)는 그대로 유지되고 여기에 더해진다.
+SALES_EMAILS = {
+    "12": [
+        "sales1@unitrontech.com",
+        "sh.hong@unitrontech.com",
+        "davidpark@unitrontech.com",
+        "ys.jung@unitrontech.com",
+        "trevis@unitrontech.com",
+        "royola@unitrontech.com",
+    ],
+    "3": ["sales3@unitrontech.com"],
+    # 주소의 숫자는 실 번호와 일치하지 않는다 (4실→sales1team, 5실→sales3team).
+    # 사내 계정 규칙이므로 번호가 어긋나 보여도 고치지 말 것.
+    "4": ["sales1team@unitrontech.com"],
+    "5": ["sales3team@unitrontech.com"],
 }
+
+def _office_recipients(slug):
+    """받는 사람 = 공통 수신자 + 실 담당자. 중복 주소는 한 번만 남기고 순서는 유지한다.
+
+    자재관리팀(sw.ahn)은 예전에 4·5실 받는 사람이었지만 지금은 전 실 참조(CC_EMAILS)다.
+    """
+    plan = list(DEFAULT_EMAILS) + SALES_EMAILS.get(slug, [])
+
+    seen, out = set(), []
+    for mail in plan:
+        key = mail.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(mail.strip())
+    return out
+
+
+OFFICE_EMAILS = {slug: _office_recipients(slug) for slug in ("12", "3", "4", "5")}
 
 
 def office_slug(name):
@@ -1443,6 +1493,7 @@ def send_office_emails(result, origin):
                 "day": day,
                 "link": f"{origin.rstrip('/')}/{office_slug(name)}",
                 "emails": OFFICE_EMAILS.get(office_slug(name), DEFAULT_EMAILS),
+                "cc": CC_EMAILS,
             })
             out["ok"].append(name)
         except Exception as e:                              # noqa: BLE001 — 한 실이 죽어도 나머지는 보낸다
