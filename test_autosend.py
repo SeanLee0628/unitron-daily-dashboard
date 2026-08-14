@@ -36,8 +36,11 @@ class TestSendOfficeEmails(unittest.TestCase):
         self.sent = []
         patcher = mock.patch.object(
             app, "_send_smtp",
-            side_effect=lambda emails, subject, body, cfg, text=None: (
-                self.sent.append({"emails": emails, "subject": subject}),
+            # 참조(cc)가 나중에 붙었는데 이 가짜 함수가 안 받아서 세 건이
+            # 조용히 실패하고 있었다. 인자를 열어 두면 다음에 뭐가 붙어도
+            # 테스트가 그 이유로 깨지지는 않는다.
+            side_effect=lambda emails, subject, body, cfg, text=None, **kw: (
+                self.sent.append({"emails": emails, "subject": subject, "cc": kw.get("cc")}),
                 {"ok": True, "sent": True, "via": "smtp", "n": len(emails)})[1])
         self.smtp = patcher.start()
         self.addCleanup(patcher.stop)
@@ -54,13 +57,26 @@ class TestSendOfficeEmails(unittest.TestCase):
         self.assertEqual(res["fail"], [])
 
     def test_recipients_follow_office_map(self):
+        """받는 사람은 실별로 다르고, 자재관리팀은 전 실 참조다.
+
+        예전에는 sw.ahn 이 4·5실 '받는 사람' 이었고 이 테스트가 그걸 지켰다.
+        2026-08-06 에 참조로 옮겼는데 테스트는 안 따라와서, 그 뒤로 계속
+        실패하고 있었다. 지금 동작에 맞춘다.
+        """
         app.send_office_emails(SAMPLE, "https://dash.example.com")
-        five = next(s for s in self.sent if "2026-07-14" in s["subject"] or True)
-        self.assertIn("seanlee@unitrontech.com", self.sent[0]["emails"])
-        self.assertIn("sw.ahn@unitrontech.com", self.sent[0]["emails"],
-                      "5실은 자재관리팀에도 간다")
-        self.assertNotIn("sw.ahn@unitrontech.com", self.sent[1]["emails"],
-                         "1,2실은 기본 수신자만")
+        for sent in self.sent:
+            self.assertIn("seanlee@unitrontech.com", sent["emails"], "공통 수신자")
+            self.assertNotIn("sw.ahn@unitrontech.com", sent["emails"],
+                             "자재관리팀은 받는 사람이 아니라 참조다")
+            self.assertIn("sw.ahn@unitrontech.com", sent["cc"] or [], "전 실 참조")
+
+    def test_4실_담당자가_받는다(self):
+        """실 담당자는 자기 실 메일에만 들어간다. 다른 실에 새면 안 된다."""
+        self.assertIn("jysong@unitrontech.com", app.OFFICE_EMAILS["4"])
+        self.assertIn("sccho@unitrontech.com", app.OFFICE_EMAILS["4"])
+        for slug in ("12", "3", "5"):
+            self.assertNotIn("jysong@unitrontech.com", app.OFFICE_EMAILS[slug])
+            self.assertNotIn("sccho@unitrontech.com", app.OFFICE_EMAILS[slug])
 
     def test_uses_today_index_for_date(self):
         app.send_office_emails(SAMPLE, "https://dash.example.com")

@@ -1433,7 +1433,12 @@ SALES_EMAILS = {
     "3": ["sales3@unitrontech.com"],
     # 주소의 숫자는 실 번호와 일치하지 않는다 (4실→sales1team, 5실→sales3team).
     # 사내 계정 규칙이므로 번호가 어긋나 보여도 고치지 말 것.
-    "4": ["sales1team@unitrontech.com"],
+    "4": [
+        "sales1team@unitrontech.com",
+        # 2026-08-14 추가.
+        "jysong@unitrontech.com",
+        "sccho@unitrontech.com",
+    ],
     "5": ["sales3team@unitrontech.com"],
 }
 
