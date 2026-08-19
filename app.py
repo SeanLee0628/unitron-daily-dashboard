@@ -20,6 +20,7 @@ import os
 import re
 import socket
 import sqlite3
+import math
 import threading
 import urllib.parse
 import webbrowser
@@ -290,6 +291,12 @@ def log_conn():
         cx.commit()
     cx.execute("CREATE INDEX IF NOT EXISTS ix_log ON log(office, dir, date)")
     cx.execute("CREATE INDEX IF NOT EXISTS ix_log_slug ON log(slug, dir, date)")
+    # 예전 판은 재고 파일을 한 번에 여러 개 올리면 전사 출고 원장을 파일 수만큼 중복 저장했다
+    # (pick_shipmgmt 주석 참고). 이미 쌓인 중복은 다시 올린 날짜만 교체되므로 저절로 없어지지
+    # 않는다 — 한 번만 훑어서 완전히 같은 행이 여러 벌인 것을 한 벌로 줄인다.
+    # 같은 날 같은 거래처에 같은 lot·수량을 두 번 출고한 진짜 중복까지 한 벌로 줄어들 수 있으나,
+    # lot 단위 원장에서 그런 행은 사실상 없고 수량이 4배로 잡히는 쪽이 훨씬 해롭다.
+    cx.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
     # 선적 리포트(PO# → 발주업체). 주간 파일을 올릴 때마다 누적된다.
     # 같은 운송장·PO·파트·SO 로 수량만 다른 분할 선적이 실제로 있어서 qty 까지 키에 넣는다 —
     # 안 그러면 3,000EA 와 750EA 중 하나가 조용히 사라진다.
@@ -472,6 +479,88 @@ def parse_shipmgmt(ws):
             doc="", mcode="", remark="", fab="",
         ))
     return out
+
+
+def pick_shipmgmt(snaps):
+    """파일별 shipping management 스냅샷 → 그중 한 파일만 골라 낸 출고 행.
+
+    재고 파일은 실별로 오지만 그 안의 'shipping management' 는 실 시트가 아니라
+    전사 공용 원장의 사본이다. 4개 실 파일을 한 번에 올리면 같은 출고가 4벌 들어와
+    원장 수량이 그대로 4배가 된다 (현장 지적: '전체 출고 원장 출고값 중복').
+
+    현장 요청대로 '한 곳의 시트만' 쓴다. 날짜별로 파일을 섞어 고르면, 정정 때문에
+    같은 출고가 파일마다 다른 날짜에 적혀 있을 경우 두 벌이 되어 중복이 되살아난다.
+    파일 하나로 통일하면 그런 경로 자체가 없다.
+
+    고르는 기준은 행이 가장 많은 파일 — 사본 중 가장 덜 잘린 것이다. 같으면 먼저
+    올린 파일. 고른 파일에 없는 날짜는 건드리지 않는다 (log_store 가 올라온 날짜만
+    갈아끼우므로, 전에 쌓아 둔 그 날짜 이력은 그대로 남는다).
+
+    반환: (행 목록, 고른 파일명)
+    """
+    best = 0
+    for i in range(1, len(snaps)):
+        if len(snaps[i][1]) > len(snaps[best][1]):
+            best = i
+    name, rows = snaps[best]
+    return rows, name
+
+
+def ledger_dupes(apply=False):
+    """이미 쌓인 전사 출고 원장에서 '파일 N벌이 통째로 겹친' 흔적을 찾는다.
+
+    이 판 이전에는 재고 파일 여러 개를 한 번에 올리면 같은 원장이 파일 수만큼 저장됐다.
+    지나간 날짜는 다시 올리지 않는 한 부풀어 있는 채로 남는다.
+
+    '완전 동일 행 = 중복' 으로 지우면 안 된다. 원장은 릴 단위라 같은 날 같은 거래처에
+    같은 lot·같은 수량을 여러 줄로 적는 게 정상이고, 실측으로 한 파일 안에만 그런 행이
+    20,071개(전체의 26.5%, 1.9억 EA) 있다.
+
+    그래서 날짜 단위로 본다. 그 날짜의 행 종류별 개수를 모두 세고 최대공약수를 구한다.
+    파일이 N벌 겹쳤다면 모든 종류의 개수가 정확히 N배라 gcd 가 N 이 된다. 겹치지 않은
+    날짜는 개수들이 서로 소라 gcd 가 1 이다 (실측: 정상 파일 308일 전부 gcd=1).
+    gcd 가 N 인 날짜만 종류별 개수를 1/N 로 줄인다.
+
+    apply=False 면 세기만 한다. 되돌릴 수 없는 삭제라 기본은 미리보기다.
+    반환: {dates, rows, qty, detail:[(날짜, 배수, 지울 행 수)]}
+    """
+    cx = log_conn()
+    try:
+        rows = cx.execute(
+            "SELECT rowid,date,customer,part,qty,sales,doc,mcode,remark,fab,lot,dcode,waybill"
+            " FROM log WHERE slug=? AND dir='out' ORDER BY rowid", (LEDGER_SLUG,)).fetchall()
+        per = defaultdict(lambda: defaultdict(list))     # 날짜 → 행종류 → [rowid]
+        for r in rows:
+            per[r[1]][r[2:]].append(r[0])
+        kill, detail = [], []
+        for d in sorted(per):
+            groups = per[d]
+            g = 0
+            for ids in groups.values():
+                g = math.gcd(g, len(ids))
+            if g < 2:
+                continue
+            n = 0
+            for ids in groups.values():
+                keep = len(ids) // g
+                kill.extend(ids[keep:]); n += len(ids) - keep
+            detail.append((d, g, n))
+        qty = 0.0
+        if kill:
+            for i in range(0, len(kill), 400):
+                chunk = kill[i:i + 400]
+                q = cx.execute("SELECT SUM(qty) FROM log WHERE rowid IN (%s)"
+                               % ",".join("?" * len(chunk)), chunk).fetchone()[0]
+                qty += q or 0.0
+            if apply:
+                for i in range(0, len(kill), 400):
+                    chunk = kill[i:i + 400]
+                    cx.execute("DELETE FROM log WHERE rowid IN (%s)"
+                               % ",".join("?" * len(chunk)), chunk)
+                cx.commit()
+        return dict(dates=len(detail), rows=len(kill), qty=qty, detail=detail)
+    finally:
+        cx.close()
 
 
 def log_day(office, date):
@@ -666,7 +755,9 @@ def parse_inventory(ws):
         return -1
 
     C = dict(
-        office=idx("Sales team"), central=idx("Central"), vender=idx("VENDER"),
+        office=idx("Sales team"), central=idx("Central"),
+        # 시트마다 VENDER/VENDOR/제조사로 적혀 온다 — 하나만 보면 조용히 빈 칸이 된다
+        vender=idx("VENDER", "VENDOR", "제조사", "MAKER", "MFR"),
         family=idx("FAMILY"), part=idx("Part#"), mobis=idx("MOBIS ID"),
         pn=idx("품번"), qty=idx("Q'ty"), avail=idx("available Q'ty"),
         booking=idx("booking"), customer=idx("CUSTOMER"), sales=idx("SALES"),
@@ -675,13 +766,21 @@ def parse_inventory(ws):
     if C["part"] < 0 or C["qty"] < 0:
         return None
 
-    # Datecode 연도 컬럼 (헤더에 4자리 연도가 들어있음)
+    # Datecode 연도 컬럼. 헤더는 'Datecode' 다음 줄에 연도가 오는 꼴이라 연도만 떼어 쓴다.
+    # 연도 하나에 칼럼 하나여야 한다 — 같은 연도가 두 번 나오면 dict 가 조용히 덮어써서
+    # 진짜 그 연도 칼럼이 사라지고 엉뚱한 값이 그 해로 잡힌다. 덮어쓰되 흔적은 남긴다.
     years = {}
     for i, h in enumerate(hdr):
-        if "DATECODE" in h.upper():
-            m = re.search(r"(20\d{2})", h)
-            if m:
-                years[int(m.group(1))] = i
+        if "DATECODE" not in h.upper():
+            continue
+        m = re.fullmatch(r"DATECODE\s*(20\d{2})", clean(h).upper(), re.S)
+        if not m:                                   # 'Datecode 2019~2022' 같은 변종
+            print(f"[재고] 해석 못 한 Datecode 헤더 (무시): {h!r}")
+            continue
+        y = int(m.group(1))
+        if y in years:
+            print(f"[재고] Datecode {y} 칼럼이 두 개다 ({years[y]}, {i}) — 뒤쪽을 쓴다")
+        years[y] = i
 
     # 일별 컬럼: '1일'~'31일' 이 두 번 반복 (앞 31개=입고, 뒤 31개=출고)
     days = [i for i, h in enumerate(hdr) if re.fullmatch(r"\d{1,2}일", h)]
@@ -712,11 +811,12 @@ def parse_inventory(ws):
             by[k][key][0] += 1
             by[k][key][1] += q
 
-        old_q, oldest = 0.0, None
+        old_q, oldest, dq = 0.0, None, {}
         for y, ci in years.items():
             v = to_num(r[ci]) if ci < len(r) else 0.0
             if v > 0:
                 dc[y][0] += 1; dc[y][1] += v
+                dq[y] = dq.get(y, 0.0) + v          # 화면에 연도별로 펼쳐 보여준다
                 if y <= OLD_YEAR:
                     old_q += v
                 if oldest is None or y < oldest:
@@ -731,7 +831,7 @@ def parse_inventory(ws):
             pn=clean(g(r, "pn")), family=clean(g(r, "family")),
             vender=clean(g(r, "vender")), office=clean(g(r, "office")),
             sales=clean(g(r, "sales")), customer=c, crd=clean(g(r, "crd")),
-            qty=q, avail=a, booking=b, old=old_q, oldest=oldest,
+            qty=q, avail=a, booking=b, old=old_q, oldest=oldest, dcq=dq,
         ))
 
     def top(k):
@@ -749,6 +849,7 @@ def parse_inventory(ws):
         old_year=OLD_YEAR,
         by_office=top("office"), by_vender=top("vender"), by_family=top("family"),
         datecode=[dict(year=y, items=dc[y][0], qty=dc[y][1]) for y in sorted(dc)],
+        years=sorted(years),
         month=dict(
             prev=sum(to_num(r[i_prev]) for r in data if 0 <= i_prev < len(r)),
             inbound=sum(daily_in), outbound=sum(daily_out),
@@ -862,7 +963,7 @@ def merge_inventories(invs):
         booking_qty=s("booking_qty"), old_qty=s("old_qty"),
         old_year=invs[0]["old_year"],
         by_office=agg("by_office"), by_vender=agg("by_vender"), by_family=agg("by_family"),
-        datecode=dc,
+        datecode=dc, years=years,
         month=dict(prev=sum(inv["month"]["prev"] for inv in invs),
                    inbound=sum(inv["month"]["inbound"] for inv in invs),
                    outbound=sum(inv["month"]["outbound"] for inv in invs),
@@ -898,7 +999,7 @@ def build_payload(files, password):
     raw_offices, inventories = [], {}     # [(실이름, {날짜:(inb,outb)})]
     logs = {}                             # 실이름 → {'in': [...], 'out': [...]} 누적 이력
     ships = []                            # 선적 리포트 행 (PO# → 발주업체)
-    shipmgmt = []                         # 전사 출고 원장 (shipping management, lot 단위)
+    shipmgmt = []                         # 전사 출고 원장 스냅샷 [(파일명, 행들)]
     for f in files:
         name = f.get("name") or "실"
         wb = open_wb(decode_upload(f["file"]), password)
@@ -916,13 +1017,12 @@ def build_payload(files, password):
                     inventories[name] = inv
                     # 재고 파일마다 들어 있는 'shipping management' 는 실별 시트가 아니라
                     # 전사 공용 출고 원장의 스냅샷이다 (실측: 파일 간 행 단위 99.4~99.8% 동일,
-                    # lot 95.5%가 3개 실에 중복). 실별로 담으면 같은 출고가 3번 계산되므로
-                    # 실 구분 없이 한 벌만 유지한다. 같은 날짜를 여러 파일이 갖고 있으면
-                    # 마지막에 올린 파일이 그 날짜를 차지한다 — 시트에 스냅샷 시점이 없어
-                    # 어느 쪽이 최신인지 알 수 없다. 파일 간 차이가 0.6% 미만이라 실무상 무해.
+                    # lot 95.5%가 3개 실에 중복). 여기서 합치면 같은 출고가 파일 수만큼
+                    # 곱해지므로 파일별로 따로 들고 있다가 pick_shipmgmt() 로 날짜마다
+                    # 한 파일만 고른다.
                     sm = shipmgmt_sheet(wb)
                     if sm is not None:
-                        shipmgmt.extend(parse_shipmgmt(sm))
+                        shipmgmt.append((name, parse_shipmgmt(sm)))
                     continue
             ws = shipping_sheet(wb)                     # 선적 리포트 (PO# → 발주업체)
             if ws is not None:
@@ -948,8 +1048,9 @@ def build_payload(files, password):
         for rows in by_dir.values():
             for r in rows:
                 C.add(r.get("customer"))
-    for r in shipmgmt:
-        C.add(r.get("customer"))
+    for _, rows in shipmgmt:
+        for r in rows:
+            C.add(r.get("customer"))
     for inv in inventories.values():
         for it in inv["items"]:
             C.add(it.get("customer"))
@@ -964,9 +1065,14 @@ def build_payload(files, password):
                 r["customer"] = C.canon(r.get("customer"))
         log_store(name, by_dir)
     if shipmgmt:
-        for r in shipmgmt:
+        sm_rows, sm_file = pick_shipmgmt(shipmgmt)
+        for r in sm_rows:
             r["customer"] = C.canon(r.get("customer"))
-        log_store(LEDGER, {"out": shipmgmt}, src="sm")
+        log_store(LEDGER, {"out": sm_rows}, src="sm")
+        if len(shipmgmt) > 1:
+            dropped = sum(len(rows) for _, rows in shipmgmt) - len(sm_rows)
+            print(f"[원장] 파일 {len(shipmgmt)}개 중 '{sm_file}' 채택 · "
+                  f"{len(sm_rows):,}행 / 중복 {dropped:,}행 제외")
     for inv in inventories.values():
         bk = defaultdict(float)
         for it in inv["items"]:
@@ -993,6 +1099,8 @@ def build_payload(files, password):
     # 실별 이력 보유 구간 — 기간 입력의 min/max 로 쓴다 (행 자체는 서버가 들고 있다)
     spans = {o["name"]: log_span(o["name"]) for o in offices}
     spans[LEDGER] = log_span(LEDGER)                # 전사 출고 원장 (실 소속 없음)
+    if shipmgmt:
+        spans[LEDGER]["src"] = sm_file             # 이번에 채택한 파일
     return dict(offices=offices, inventories=inventories, spans=spans)
 
 
@@ -1028,9 +1136,9 @@ def export_xlsx(payload):
                 if isinstance(c.value, (int, float)):
                     c.number_format = "#,##0"
                     c.alignment = Alignment(horizontal="right")
-        if red_col:
+        for rc in ([red_col] if isinstance(red_col, int) else (red_col or [])):
             for row in ws.iter_rows(min_row=4, max_row=ws.max_row,
-                                    min_col=red_col, max_col=red_col):
+                                    min_col=rc, max_col=rc):
                 for c in row:
                     if isinstance(c.value, (int, float)) and c.value > 0:
                         c.font = RED
@@ -1055,15 +1163,38 @@ def export_xlsx(payload):
         # 재고의 'CUSTOMER' 칸은 실제로 PO# 다. 헤더를 바로잡고, 선적 리포트로
         # 찾아낸 발주업체를 옆에 붙인다 (리포트를 안 올렸으면 빈 칸으로 나간다).
         buyers = po_lookup([i.get("customer") for i in inv["items"]])
+
+        def dq(it, y):
+            return to_num((it.get("dcq") or {}).get(str(y)))
+
+        yrs = [y for y in (inv.get("years") or [])
+               if any(dq(i, y) > 0 for i in inv["items"])]
+        old_y = inv.get("old_year") or OLD_YEAR
+        base_h = ["PART#", "PO# / 고객", "발주업체", "MOBIS ID", "FAMILY", "VENDER", "실", "담당",
+                  "재고", "가용", "예약"]
+        # 화면과 같은 폴백: 연도별 수량이 없는 옛 자료면 예전 장기재고/Datecode 칼럼으로
+        def gap(i):
+            d = (i.get("dcq") or {})
+            if not d:
+                return ""
+            t = sum(to_num(v) for v in d.values())
+            return "" if abs(t - to_num(i.get("qty"))) < 0.5 else f"Datecode 합 {t:,.0f}"
+
+        tail_h = ([f"DC {y}" for y in yrs] + ["확인"]) if yrs else ["장기재고", "Datecode"]
+        tail_w = ([11] * len(yrs) + [20]) if yrs else [12, 11]
+        tail = ((lambda i: [dq(i, y) or "" for y in yrs] + [gap(i)]) if yrs
+                else (lambda i: [i.get("old") or "", i.get("oldest") or ""]))
+        red = ([len(base_h) + n for n, y in enumerate(yrs, 1) if y <= old_y] if yrs
+               else [len(base_h) + 1])
         sheet("품목", f"품목별 재고 · {office}",
-              ["PART#", "PO# / 고객", "발주업체", "MOBIS ID", "FAMILY", "VENDER", "실", "담당",
-               "재고", "가용", "예약", "장기재고", "Datecode"],
+              base_h + tail_h,
               [[i["part"], i["customer"], " / ".join(buyers.get(i["customer"], [])),
                 i["mobis"], i["family"], i["vender"], i["office"], i["sales"],
-                i["qty"], i["avail"], i["booking"], i["old"], i["oldest"] or ""] for i in
+                i["qty"], i["avail"], i["booking"]] + tail(i) for i in
                sorted(inv["items"], key=lambda x: -x["qty"])],
-              widths=[26, 18, 24, 16, 16, 12, 10, 10, 12, 12, 12, 12, 11],
-              red_col=12)
+              widths=[26, 18, 24, 16, 16, 12, 10, 10, 12, 12, 12] + tail_w,
+              # 장기재고(=old_year 이전) 연도 칼럼만 빨강 — 화면 표와 같은 규칙
+              red_col=red)
         # Datecode 는 영업1,2실에만 채워져 있다 → 있는 실에서만 시트를 만든다
         dc = [d for d in inv["datecode"] if d["qty"] > 0]
         if dc:
@@ -1574,6 +1705,17 @@ class Handler(BaseHTTPRequestHandler):
                 cx.close()
             except Exception as e:  # noqa: BLE001
                 info["db_error"] = str(e)
+            try:
+                # 옛 판이 남긴 원장 중복 (지우지 않는다. 세어서 보여만 준다 —
+                # 정리는 `python app.py --dedupe-ledger --apply` 로 사람이 돌린다)
+                dup = ledger_dupes()
+                info["ledger_dupe_dates"] = dup["dates"]
+                info["ledger_dupe_rows"] = dup["rows"]
+                info["ledger_dupe_qty"] = round(dup["qty"])
+                if dup["rows"]:
+                    info["ledger_dupe_hint"] = "python app.py --dedupe-ledger 로 확인 후 --apply"
+            except Exception as e:  # noqa: BLE001
+                info["ledger_dupe_error"] = str(e)
             self._send(200, json.dumps(info, ensure_ascii=False, indent=1))
         elif path == "/day":                             # 누적 이력에서 하루치 되살리기
             q = urllib.parse.parse_qs(self.path.partition("?")[2])
@@ -1787,6 +1929,21 @@ td.dt{font-variant-numeric:tabular-nums;color:#666;white-space:nowrap;}
 .viewseg button.on{background:#fff;color:var(--ink);box-shadow:0 2px 8px rgba(0,0,0,.12);}
 tr.oldrow td{background:#fdf1f1;}
 td.old{color:var(--red);font-weight:800;}
+th.old{color:var(--red);}                     /* 장기재고에 해당하는 Datecode 연도 칼럼 */
+td.dcy,th.dcy{white-space:nowrap;padding-left:9px;padding-right:9px;}
+td.nw{white-space:nowrap;}                    /* 칼럼이 늘어난 재고 표에서 줄바꿈 방지 */
+.warn{color:var(--amber);font-weight:900;margin-left:4px;cursor:help;}
+/* 재고 표는 Datecode 연도 칼럼이 붙어 18칸이 된다 — 1280px 안에서는 뒤쪽 연도가 잘려서
+   화면 폭이 허락하는 만큼 이 화면만 넓게 쓴다 (좁은 노트북에서는 가로 스크롤로 떨어진다). */
+#invview{max-width:min(1700px,98vw);}
+body.wideview #viewnav{max-width:min(1700px,98vw);}   /* 표만 넓어져 탭이 어긋나지 않게 */
+/* 칼럼이 많아 가로 스크롤이 생기면 # 과 PART# 는 왼쪽에 붙여 둔다 — 2026 칸까지
+   밀어놓고 보면 어느 품목 줄인지 알 수 없어진다. --c1 은 그릴 때마다 실측해 넣는다. */
+#invtable td.stk1,#invtable th.stk1{position:sticky;left:0;z-index:2;background:#fff;}
+#invtable td.stk2,#invtable th.stk2{position:sticky;left:var(--c1,44px);z-index:2;
+  background:#fff;box-shadow:1px 0 0 var(--line);}
+#invtable thead th.stk1,#invtable thead th.stk2{z-index:4;background:#fafafb;}
+#invtable tr.oldrow td.stk1,#invtable tr.oldrow td.stk2{background:#fdf1f1;}
 .kpi .l{font-size:11.5px;color:var(--mut);font-weight:600;}
 .kpi .v{font-size:25px;font-weight:900;margin-top:8px;letter-spacing:-.6px;line-height:1;}
 .kpi .u{font-size:12px;font-weight:600;color:var(--mut);margin-left:2px;}
@@ -1965,7 +2122,7 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
         <span class="andlab">AND</span>
         <select class="fsel" id="inv-f2"></select>
         <input class="fval" id="inv-v2" placeholder="값 입력…">
-        <button class="go" onclick="renderInvTable()">조회</button>
+        <button class="go" onclick="drawInvTable()">조회</button>
         <button class="off" onclick="clearInvSearch()">초기화</button>
         <span class="hit" id="inv-hit"></span>
       </div>
@@ -2140,6 +2297,8 @@ function showView(v){
   document.getElementById('invview').style.display=v==='inv'?'block':'none';
   document.getElementById('smview').style.display =v==='sm' ?'block':'none';
   ['io','inv','sm'].forEach(k=>document.getElementById('vw-'+k).classList.toggle('on',k===v));
+  document.body.classList.toggle('wideview', v==='inv');   // 재고 표만 화면을 넓게 쓴다
+  if(v==='inv') fixSticky();
   if(v==='inv'){
     const I=INVS[INVK];
     if(!I) return;
@@ -2428,7 +2587,8 @@ const F_IO =[['all','전체'],['customer','거래처'],['part','PART#'],
              ['sales','담당'],['waybill','운송장번호'],['doc','문서번호'],
              ['lot','lot number'],['dcode','DATECODE'],['remark','비고']];
 const F_INV=[['all','전체'],['part','PART#'],['customer','PO# / 고객'],['buyer','발주업체'],
-             ['mobis','MOBIS ID'],['family','FAMILY'],['sales','담당'],['office','실']];
+             ['mobis','MOBIS ID'],['family','FAMILY'],['vender','VENDER'],
+             ['sales','담당'],['office','실']];
 
 function fillFields(prefix, fields, d1, d2){
   const opt=f=>fields.map(([v,l])=>`<option value="${v}"${v===f?' selected':''}>${l}</option>`).join('');
@@ -2457,9 +2617,10 @@ function applyConds(rows, conds, allOf){
 }
 
 const NUMCOL={qty:1,avail:1,booking:1,old:1};
+const isNumCol=k=>NUMCOL[k]||/^y20\d\d$/.test(k);      // y2019… = Datecode 연도별 수량
 function cmpBy(k,d){
   return (a,b)=>{
-    if(NUMCOL[k]) return ((Number(a[k])||0)-(Number(b[k])||0))*d;
+    if(isNumCol(k)) return ((Number(a[k])||0)-(Number(b[k])||0))*d;
     return String(a[k]==null?'':a[k]).localeCompare(String(b[k]==null?'':b[k]),'ko',{numeric:true})*d;
   };
 }
@@ -2661,7 +2822,8 @@ function initSmBar(){
   const f=document.getElementById('sm-from'), t=document.getElementById('sm-to');
   f.min=t.min=SMSPAN.min; f.max=t.max=SMSPAN.max;
   document.getElementById('sm-note').textContent=
-    `원장 ${SMSPAN.min} ~ ${SMSPAN.max} · ${fmt(SMSPAN.rows)}행 · lot 단위 출고 내역 (재고 파일의 shipping management 시트)`;
+    `원장 ${SMSPAN.min} ~ ${SMSPAN.max} · ${fmt(SMSPAN.rows)}행 · lot 단위 출고 내역 (재고 파일의 shipping management 시트)`+
+    (SMSPAN.src?` · 이 시트는 여러 실 파일에 같은 내용으로 들어 있어 '${SMSPAN.src}' 파일 것만 씁니다`:'');
   smPreset('all', true);
 }
 function smPreset(kind, quiet){
@@ -2779,8 +2941,12 @@ function renderInventory(){
     `<span class="lab">영업실</span>`+
     `<button class="on" style="cursor:default" disabled>${esc(INVK)}</button>`;
 
+  const dcOn=I.items.some(x=>x.dcq&&Object.keys(x.dcq).length);
   document.getElementById('inv-foot').textContent=
-    `자료: 재고 엑셀의 '${I.sheet}' 시트 · 재고 수량이 있는 품목만 집계 (합계 행 제외) · 장기재고 = Datecode ${I.old_year}년 이전`;
+    `자료: 재고 엑셀의 '${I.sheet}' 시트 · 재고 수량이 있는 품목만 집계 (합계 행 제외) · `+
+    (dcOn?`Datecode 가 적힌 품목은 DC 연도별 수량의 합 = 그 품목의 '재고' 수량 `+
+          `(원본이 안 맞으면 ⚠, Datecode 가 아예 없는 품목은 전부 '—') · `:'')+
+    `장기재고 = Datecode ${I.old_year}년 이전 (빨간 칼럼)`;
 
   // 노후화(Datecode)는 영업1,2실에만 데이터가 있다. 없는 실에서는 관련 요소를 아예 뺀다.
   const hasDC=I.datecode.some(d=>d.qty>0);
@@ -2941,44 +3107,79 @@ function sortInv(key){ nextDir(ISORT,key); drawInvTable(); }
 function clearInvSearch(){ clearFields('inv'); drawInvTable(); }
 
 // '발주업체' 로 검색하려면 조인 결과가 행에 있어야 한다 — 필터 직전에 붙여 둔다
-const INV_ALL=x=>[x.part,x.mobis,x.family,x.sales,x.customer,x.pn,x.office,x.buyer];
+const INV_ALL=x=>[x.part,x.mobis,x.family,x.vender,x.sales,x.customer,x.pn,x.office,x.buyer];
 
 function drawInvTable(){
   const I=INVS[INVK];
   if(!I) return;
-  let base=I.items.map(x=>({...x, buyer:buyerOf(x)}));
+  // Datecode 연도별 수량을 y2019… 칸으로 펼쳐 둔다 — 검색·정렬이 다른 칸과 똑같이 돌게.
+  let base=I.items.map(x=>{
+    const o={...x, buyer:buyerOf(x)};
+    let sum=0, n=0;
+    for(const y in (x.dcq||{})){ o['y'+y]=x.dcq[y]; sum+=x.dcq[y]; n++; }
+    // 연도별 합이 재고 수량과 안 맞는 품목이 실제로 있다 (원본 시트가 그렇다).
+    // 조용히 덮지 않고 재고 칸에 표시해 둔다 — 어느 쪽이 맞는지는 사람이 판단할 몫.
+    o.dcgap = (n && Math.abs(sum-x.qty)>0.5) ? sum-x.qty : 0;
+    return o;
+  });
   if(ITAB==='old') base=base.filter(x=>x.old>0);
   if(ITAB==='bk')  base=base.filter(x=>x.booking>0);
   const conds=condsOf('inv');
   let rows=applyConds(base, conds, INV_ALL);
   document.getElementById('inv-hit').textContent=conds.length?hitText(rows.length,base.length):'';
-  rows=[...rows].sort(ISORT.d?cmpBy(ISORT.k,ISORT.d):(a,b)=>b.qty-a.qty);
+  // 장기재고 탭에서는 장기 수량이 많은 순 — 어디부터 손댈지 고르는 화면이라.
+  const DEF=ITAB==='old'?(a,b)=>b.old-a.old:(a,b)=>b.qty-a.qty;
+  rows=[...rows].sort(ISORT.d?cmpBy(ISORT.k,ISORT.d):DEF);
 
   const el=document.getElementById('invtable');
   if(!rows.length){ el.innerHTML=base.length?noHit():emptyMsg(); return; }
-  // 장기재고/Datecode 칼럼은 데이터가 있는 실에서만 (영업1,2실)
-  const dc=I.datecode.some(d=>d.qty>0);
+  // Datecode 칼럼은 데이터가 있는 실에서만. '장기재고' 합계 한 칸 대신 연도별로 쪼갠다 —
+  // 합계만 놓으면 '재고 6,000 + 장기 3,136 = 9,136?' 처럼 읽힌다는 현장 지적이 있었다.
+  // 칼럼 구성은 탭·검색과 무관하게 실 단위로 고정한다 (필터마다 칼럼이 들락거리면 읽기 힘들다).
+  const OY=I.old_year;
+  const ALLY=(I.years&&I.years.length)?I.years
+    :[...new Set(I.items.flatMap(x=>Object.keys(x.dcq||{}).map(Number)))].sort((a,b)=>a-b);
+  const YRS=ALLY.filter(y=>I.items.some(x=>x.dcq&&x.dcq[y]>0));
+  // 배포 직후에는 이전 판이 저장해 둔 자료가 그대로 올라온다 — 거기엔 연도별 수량이 없다.
+  // 재고 파일을 다시 올리기 전까지는 예전 '장기재고/Datecode' 칼럼으로 버틴다.
+  const legacy=!YRS.length && I.datecode.some(d=>d.qty>0);
+  const dc=YRS.length>0||legacy;
+  // VENDER 검색은 항상 열려 있고, 칼럼만 여러 곳이 섞인 실에서 보여준다 (영업4실)
+  const hasVen=new Set(I.items.map(x=>x.vender).filter(Boolean)).size>1;
   // 발주업체 칼럼은 선적 리포트를 올렸고 실제로 붙는 게 있을 때만 (영업1,2실은 전부 빈칸이라 뺀다)
   const hasBuyer=POROWS>0 && base.some(x=>x.buyer);
   const S=(l,k,c)=>th(l,k,ISORT,'sortInv',c);
-  el.innerHTML=`<table><thead><tr><th>#</th>${S('PART#','part')}${S(poHeader(I.items),'customer')}${hasBuyer?S('발주업체','buyer'):''}
-    ${S('MOBIS ID','mobis')}${S('FAMILY','family')}
+  const YH=YRS.map(y=>S('DC '+y,'y'+y,'n dcy'+(y<=OY?' old':''))).join('');
+  const YC=x=>YRS.map(y=>`<td class="n dcy${y<=OY&&x['y'+y]?' old':''}">${x['y'+y]?fmt(x['y'+y]):'—'}</td>`).join('');
+  el.innerHTML=`<table><thead><tr><th class="stk1">#</th>${S('PART#','part','stk2')}${S(poHeader(I.items),'customer')}${hasBuyer?S('발주업체','buyer'):''}
+    ${S('MOBIS ID','mobis')}${S('FAMILY','family')}${hasVen?S('VENDER','vender'):''}
     ${S('실','office')}${S('재고','qty','n')}${S('가용','avail','n')}${S('예약','booking','n')}
-    ${dc?S('장기재고','old','n')+S('Datecode','oldest'):''}${S('담당','sales')}</tr></thead><tbody>${
+    ${YH}${legacy?S('장기재고','old','n')+S('Datecode','oldest'):''}${S('담당','sales')}</tr></thead><tbody>${
     rows.map((x,i)=>`<tr class="${dc&&x.old>0?'oldrow':''}">
-      <td class="n">${i+1}</td>
-      <td class="part">${esc(x.part)}</td>
+      <td class="n stk1">${i+1}</td>
+      <td class="part stk2">${esc(x.part)}</td>
       <td class="po">${esc(x.customer)||'—'}</td>
       ${hasBuyer?`<td>${buyerCell(x)}</td>`:''}
-      <td>${esc(x.mobis)||'—'}</td>
+      <td class="nw">${esc(x.mobis)||'—'}</td>
       <td>${esc(x.family)||'—'}</td>
-      <td>${esc(x.office)||'—'}</td>
-      <td class="qty">${fmt(x.qty)}</td>
+      ${hasVen?`<td class="nw">${esc(x.vender)||'—'}</td>`:''}
+      <td class="nw">${esc(x.office)||'—'}</td>
+      <td class="qty">${fmt(x.qty)}${x.dcgap?`<span class="warn" title="Datecode 연도별 합계는 ${fmt(x.qty+x.dcgap)} EA 로 재고 수량과 ${fmt(Math.abs(x.dcgap))} EA 차이납니다 (원본 시트 그대로)">⚠</span>`:''}</td>
       <td class="n">${fmt(x.avail)}</td>
       <td class="n">${x.booking?fmt(x.booking):'—'}</td>
-      ${dc?`<td class="n ${x.old>0?'old':''}">${x.old?fmt(x.old):'—'}</td>
+      ${YC(x)}
+      ${legacy?`<td class="n ${x.old>0?'old':''}">${x.old?fmt(x.old):'—'}</td>
       <td>${x.oldest?('<span class="pill">'+x.oldest+'~</span>'):'—'}</td>`:''}
       <td>${esc(x.sales)||'—'}</td></tr>`).join('')}</tbody></table>`;
+  fixSticky();
+}
+
+// PART# 를 왼쪽에 붙여 둘 위치 = 실제로 그려진 '#' 칸 너비 (자리수에 따라 달라진다).
+// 화면이 숨어 있을 때 재면 0 이 나오므로 뷰를 켤 때도 한 번 더 잰다.
+function fixSticky(){
+  const el=document.getElementById('invtable');
+  const c1=el&&el.querySelector('tbody td');
+  if(c1&&c1.offsetWidth) el.style.setProperty('--c1', c1.offsetWidth+'px');
 }
 </script></body></html>"""
 
@@ -2988,7 +3189,27 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="일일 입출고 리포트 대시보드")
     ap.add_argument("--port", type=int, default=8780)
     ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--dedupe-ledger", action="store_true",
+                    help="전사 출고 원장에 남은 옛 중복을 세어 본다 (기본은 미리보기)")
+    ap.add_argument("--apply", action="store_true",
+                    help="--dedupe-ledger 와 함께: 실제로 지운다 (되돌릴 수 없음)")
     args = ap.parse_args()
+
+    if args.dedupe_ledger:
+        r = ledger_dupes(apply=args.apply)
+        if not r["rows"]:
+            print("전사 출고 원장: 파일 여러 벌이 겹친 흔적 없음.")
+            raise SystemExit(0)
+        print(f"{'지웠습니다' if args.apply else '미리보기 (아직 안 지움)'} — "
+              f"{r['dates']}일 · {r['rows']:,}행 · {r['qty']:,.0f} EA")
+        for d, g, n in r["detail"][:20]:
+            print(f"  {d}  {g}벌 겹침 → {n:,}행")
+        if len(r["detail"]) > 20:
+            print(f"  … 외 {len(r['detail']) - 20}일")
+        if not args.apply:
+            print()
+            print("실제로 지우려면: python app.py --dedupe-ledger --apply")
+        raise SystemExit(0)
     env_port = os.environ.get("PORT")
     if env_port:                                   # 클라우드(Render 등): 0.0.0.0 + $PORT
         host, port = "0.0.0.0", int(env_port)
