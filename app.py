@@ -1538,8 +1538,6 @@ def send_email(payload):
 #   "frankie@unitrontech.com", "mh.choi@unitrontech.com", "yj.park@unitrontech.com"
 DEFAULT_EMAILS = [
     "seanlee@unitrontech.com",
-    "lindsay@unitrontech.com",
-    "hskang@unitrontech.com",
 ]
 
 # 전 실 참조(Cc). 2026-08-06 — 받는 사람이 아니라 참조로 간다.
@@ -1560,6 +1558,8 @@ SALES_EMAILS = {
         "ys.jung@unitrontech.com",
         "trevis@unitrontech.com",
         "royola@unitrontech.com",
+        # 2026-08-25 추가.
+        "henry.jeong@unitrontech.com",
     ],
     "3": ["sales3@unitrontech.com"],
     # 주소의 숫자는 실 번호와 일치하지 않는다 (4실→sales1team, 5실→sales3team).
