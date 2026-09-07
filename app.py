@@ -40,6 +40,7 @@ DEFAULT_PW = os.environ.get("XLSX_PW", "")
 CHART_JS = os.path.join(HERE, "chart.umd.min.js")
 DATA_FILE = os.path.join(os.environ.get("DATA_DIR", HERE), "saved_data.json")  # 데이터 저장(공유)
 LOG_DB = os.path.join(os.environ.get("DATA_DIR", HERE), "log.db")             # 입출고 이력(기간 조회)
+MEMO_VER = 2                    # 재고 메모 저장 형식 (2 = booking 칸 메모만)
 
 
 def clean(x):
@@ -135,11 +136,18 @@ def memo_rows(ws):
     return out
 
 
-def memo_text(mrows, rn, hdr=None):
-    """그 행의 메모를 '칸이름: 내용' 으로 붙여 한 줄로. 칸이름을 모르면 내용만."""
+def memo_text(mrows, rn, hdr=None, only=None):
+    """그 행의 메모를 '칸이름: 내용' 으로 붙여 한 줄로. 칸이름을 모르면 내용만.
+
+    only 에 칸번호를 주면 그 칸에 달린 메모만, 칸이름 접두어 없이 낸다.
+    재고 시트는 booking 칸(S열) 메모만 쓰기로 했다 — 행 전체를 이어 붙이면
+    상관없는 칸 메모까지 같이 나온다.
+    """
     got = mrows.get(rn)
     if not got:
         return ""
+    if only is not None:
+        return " / ".join(t for ci, t in got if ci == only) if only >= 0 else ""
     parts = []
     for ci, txt in got:
         h = ""
@@ -879,7 +887,8 @@ def parse_inventory(ws):
             vender=clean(g(r, "vender")), office=clean(g(r, "office")),
             sales=clean(g(r, "sales")), customer=c, crd=clean(g(r, "crd")),
             qty=q, avail=a, booking=b, old=old_q, oldest=oldest, dcq=dq,
-            memo=memo_text(mrows, rn, hdr),
+            # 재고 시트 메모는 booking(예약) 칸에 단다 — 그 칸 것만 보여준다
+            memo=memo_text(mrows, rn, hdr, only=C["booking"]),
         ))
 
     def top(k):
@@ -941,6 +950,62 @@ def day_block(date, inbound, outbound):
                        memo=r.get("memo", ""))
                   for r in outbound],
     )
+
+
+# 재고 시트 헤더 (메모 앞에 붙여 저장했던 칸이름) — 옛 저장분 정리에만 쓴다
+HDRTAG = re.compile(r"booking|q'?ty|availableq'?ty|datecode\d{4}|\d{1,2}일|mobisid|part#"
+                    r"|customer|sales|salesteam|family|vender|vendor|site|central"
+                    r"|품번|crd|전월|no|date")
+
+
+def migrate_saved_memos():
+    """저장돼 있는 재고 메모를 booking 칸 것만 남기게 고친다 (한 번만).
+
+    예전엔 행에 달린 메모를 전부 '칸이름: 내용' 으로 이어 붙여 저장했다. 파싱은 고쳤지만
+    이미 올라간 데이터는 그대로라, 엑셀을 다시 올리기 전까지 옛 메모가 그대로 보인다.
+    """
+    try:
+        if not os.path.exists(DATA_FILE):
+            return
+        with open(DATA_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("memo_ver") == MEMO_VER:
+            return
+        n = 0
+        for inv in (data.get("inventories") or {}).values():
+            for it in inv.get("items") or []:
+                old = it.get("memo") or ""
+                if not old:
+                    continue
+                new = _booking_part(old)
+                if new != old:
+                    it["memo"] = new; n += 1
+        data["memo_ver"] = MEMO_VER
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        print(f"[메모] 저장된 재고 메모 {n}건을 booking 칸 것만 남기게 정리")
+    except Exception as e:
+        print(f"[메모] 저장분 정리 실패 — 건너뜀: {e}")
+
+
+def _booking_part(txt):
+    """'Q'ty: ... / booking: ... / 1일: ...' 에서 booking 칸 몫만 떼어 낸다.
+
+    칸이름 없는 조각은 바로 앞 칸에 이어지는 내용이다 (메모 안에 ' / ' 가 들어 있던 경우).
+    칸이름이 하나도 없으면 이미 새 형식이므로 그대로 둔다.
+    """
+    cur, keep, tagged = None, [], False
+    for pc in txt.split(" / "):
+        m = re.match(r"([^:]{1,20}):\s*(.*)$", pc, re.S)
+        # 메모 내용에도 콜론이 들어간다 ('출고: 1,000ea'). 재고 시트에 실제로 있는
+        # 칸이름일 때만 칸 표시로 본다 — 아니면 앞 칸 내용이 이어지는 것으로 친다.
+        if m and HDRTAG.fullmatch(re.sub(r"\s+", "", m.group(1)).lower()):
+            tagged = True
+            cur = re.sub(r"\s+", "", m.group(1)).lower()
+            pc = m.group(2)
+        if cur == "booking" and pc:
+            keep.append(pc)
+    return txt if not tagged else " / ".join(keep)
 
 
 def open_wb(raw, password):
@@ -1219,7 +1284,8 @@ def build_payload(files, password):
     spans[LEDGER] = log_span(LEDGER)                # 전사 출고 원장 (실 소속 없음)
     if shipmgmt:
         spans[LEDGER]["src"] = sm_file             # 이번에 채택한 파일
-    return dict(offices=offices, inventories=inventories, spans=spans)
+    return dict(offices=offices, inventories=inventories, spans=spans,
+                memo_ver=MEMO_VER)
 
 
 # ---------------------------------------------------------------- Excel 내보내기
@@ -3297,8 +3363,8 @@ function drawInvTable(){
   const YC=x=>YRS.map(y=>`<td class="n dcy${y<=OY&&x['y'+y]?' old':''}">${x['y'+y]?fmt(x['y'+y]):'—'}</td>`).join('');
   el.innerHTML=`<table><thead><tr><th class="stk1">#</th>${S('PART#','part','stk2')}${S(poHeader(I.items),'customer')}${hasBuyer?S('발주업체','buyer'):''}
     ${S('MOBIS ID','mobis')}${S('FAMILY','family')}${hasVen?S('VENDER','vender'):''}
-    ${S('실','office')}${S('재고','qty','n')}${S('가용','avail','n')}${S('예약','booking','n')}
-    ${YH}${legacy?S('장기재고','old','n')+S('Datecode','oldest'):''}${S('담당','sales')}${MM?S('메모','memo'):''}</tr></thead><tbody>${
+    ${S('실','office')}${S('재고','qty','n')}${S('가용','avail','n')}${S('예약','booking','n')}${MM?S('메모','memo'):''}
+    ${YH}${legacy?S('장기재고','old','n')+S('Datecode','oldest'):''}${S('담당','sales')}</tr></thead><tbody>${
     rows.map((x,i)=>`<tr class="${dc&&x.old>0?'oldrow':''}">
       <td class="n stk1">${i+1}</td>
       <td class="part stk2">${esc(x.part)}</td>
@@ -3311,10 +3377,11 @@ function drawInvTable(){
       <td class="qty">${fmt(x.qty)}${x.dcgap?`<span class="warn" title="Datecode 연도별 합계는 ${fmt(x.qty+x.dcgap)} EA 로 재고 수량과 ${fmt(Math.abs(x.dcgap))} EA 차이납니다 (원본 시트 그대로)">⚠</span>`:''}</td>
       <td class="n">${fmt(x.avail)}</td>
       <td class="n">${x.booking?fmt(x.booking):'—'}</td>
+      ${MM?memoTd(x.memo):''}
       ${YC(x)}
       ${legacy?`<td class="n ${x.old>0?'old':''}">${x.old?fmt(x.old):'—'}</td>
       <td>${x.oldest?('<span class="pill">'+x.oldest+'~</span>'):'—'}</td>`:''}
-      <td>${esc(x.sales)||'—'}</td>${MM?memoTd(x.memo):''}</tr>`).join('')}</tbody></table>`;
+      <td>${esc(x.sales)||'—'}</td></tr>`).join('')}</tbody></table>`;
   fixSticky();
 }
 
@@ -3361,6 +3428,7 @@ if __name__ == "__main__":
     else:                                          # 로컬: localhost + 빈 포트 자동
         host, port = "127.0.0.1", find_free_port(args.port)
     url = f"http://localhost:{port}/"
+    migrate_saved_memos()                          # 저장돼 있던 옛 재고 메모 정리
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"\n일일 입출고 리포트 → {url} (bind {host}:{port})\n종료: Ctrl+C")
     if not args.no_open:
