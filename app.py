@@ -118,18 +118,53 @@ def _hkey(h):
     return clean(h).upper().replace(" ", "").replace("'", "").replace("/", "")
 
 
+def memo_rows(ws):
+    """시트의 셀 메모를 행 단위로 모은다 → {엑셀 행번호: [(칸번호, 내용)]}.
+
+    메모는 셀 하나에 붙는데 화면은 행 단위라, 같은 행에 여러 개 달려 있으면 이어 붙인다.
+    """
+    out = defaultdict(list)
+    try:
+        for (rn, ci), txt in (getattr(ws, "comments", None) or {}).items():
+            if txt:
+                out[rn].append((ci, txt))
+    except Exception as e:                          # 메모 때문에 업로드가 죽으면 안 된다
+        print(f"[메모] {getattr(ws, 'title', '?')} 읽기 실패 — 건너뜀: {e}")
+    for v in out.values():
+        v.sort()
+    return out
+
+
+def memo_text(mrows, rn, hdr=None):
+    """그 행의 메모를 '칸이름: 내용' 으로 붙여 한 줄로. 칸이름을 모르면 내용만."""
+    got = mrows.get(rn)
+    if not got:
+        return ""
+    parts = []
+    for ci, txt in got:
+        h = ""
+        if hdr and ci < len(hdr):
+            h = re.sub(r"\s+", " ", clean(hdr[ci])).strip()
+        parts.append(f"{h}: {txt}" if h else txt)
+    return " / ".join(parts)
+
+
 def parse_daily(ws):
     """날짜 시트 1개 → (inbound[], outbound[]). 컬럼은 헤더로 동적 인식(실마다 배치 달라도 OK)."""
     mode = None
     cols = {}
+    hdr = []
+    mrows = memo_rows(ws)
     inbound, outbound = [], []
-    for r in ws.iter_rows(values_only=True):
+    # iter_rows 는 빈 행도 채워서 순서대로 내므로 인덱스가 곧 엑셀 행번호다
+    for rn, r in enumerate(ws.iter_rows(values_only=True), start=1):
         if not r:
             continue
         c0 = clean(r[0])
         if c0 and not c0.isdigit():
             if c0 == "NO":                          # 헤더행 → 컬럼 위치 매핑
                 cols = {_hkey(h): i for i, h in enumerate(r) if clean(h)}
+                hdr = list(r)
                 continue
             if "입고" in c0:
                 mode = "in"; continue
@@ -164,6 +199,7 @@ def parse_daily(ws):
             inbound.append(dict(
                 part=part, qty=qty, customer=col("CUSTOMER", "SR#", "공급처"),
                 sales=sales, fab=col("FAB"), remark=col("REMARK"),
+                memo=memo_text(mrows, rn, hdr),
             ))
         elif mode == "out":
             outbound.append(dict(
@@ -171,6 +207,7 @@ def parse_daily(ws):
                 doc=col("문서번호", "DOC"), remark=col("REMARK"), vendor=col("VENDOR"),
                 # 운송장번호는 날짜 시트에만 있다 (누적 '출고' 시트에는 이 칸이 없음)
                 waybill=col("운송장번호", "운송장", "WAYBILL", "TRACKINGNUMBER"),
+                memo=memo_text(mrows, rn, hdr),
             ))
     return inbound, outbound
 
@@ -275,7 +312,7 @@ def log_conn():
     # src: 이 행이 어느 시트에서 왔나. 'sm'(shipping management) 이 'sheet'(누적 출고) 를 이긴다.
     # 같은 출고를 두 시트가 다르게 적고 있어서(누적=주문 단위, sm=lot 단위) 우선순위가 없으면
     # 마지막에 올린 파일이 이기는 비결정적 동작이 된다.
-    for col in ("src", "lot", "dcode", "waybill"):
+    for col in ("src", "lot", "dcode", "waybill", "memo"):
         if col not in {r[1] for r in cx.execute("PRAGMA table_info(log)")}:
             cx.execute(f"ALTER TABLE log ADD COLUMN {col} TEXT")
             if col == "src":
@@ -340,12 +377,12 @@ def log_store(office, by_dir, src="sheet"):
             rows = [(office, slug, d, r["date"], r["customer"], r["part"], r["qty"],
                      r["sales"], r.get("doc", ""), r.get("mcode", ""), r.get("remark", ""),
                      r.get("fab", ""), src, r.get("lot", ""), r.get("dcode", ""),
-                     r.get("waybill", ""))
+                     r.get("waybill", ""), r.get("memo", ""))
                     for r in rs]
             cx.executemany(
                 "INSERT INTO log(office,slug,dir,date,customer,part,qty,sales,doc,mcode,"
-                "remark,fab,src,lot,dcode,waybill) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                "remark,fab,src,lot,dcode,waybill,memo) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             total += len(rows)
         # 같은 실을 다른 이름으로 올린 적이 있으면 표시 이름만 최신으로 맞춘다
         cx.execute("UPDATE log SET office=? WHERE slug=? AND office<>?", (office, slug, office))
@@ -359,13 +396,15 @@ def log_store(office, by_dir, src="sheet"):
 # (정렬 키가 SQL 에 그대로 들어가므로 화이트리스트가 곧 주입 차단이다).
 LOG_FIELDS = {"customer": "customer", "part": "part", "sales": "sales",
               "doc": "doc", "mcode": "mcode", "remark": "remark", "date": "date",
-              "fab": "fab", "lot": "lot", "dcode": "dcode", "waybill": "waybill"}
+              "fab": "fab", "lot": "lot", "dcode": "dcode", "waybill": "waybill",
+              "memo": "memo"}
 LOG_ALL_COLS = ["customer", "part", "sales", "doc", "mcode", "remark", "lot", "dcode",
-                "waybill"]
+                "waybill", "memo"]
 LOG_SORTS = dict(LOG_FIELDS, qty="qty")
 FIELD_KO = {"customer": "거래처", "part": "PART#", "sales": "담당",
             "doc": "문서번호", "mcode": "Material Code", "remark": "비고", "date": "일자",
-            "lot": "lot number", "dcode": "DATECODE", "waybill": "운송장번호"}
+            "lot": "lot number", "dcode": "DATECODE", "waybill": "운송장번호",
+            "memo": "메모"}
 
 
 def log_scope(office):
@@ -419,10 +458,10 @@ def log_query(office, dfrom, dto, conds, sort="date", direction="desc",
                 f"FROM log WHERE dir=? AND {sql}", [d] + args).fetchone()
             rows = [dict(date=a, customer=b, part=c, qty=round(e), sales=f,
                          doc=g, mcode=h, remark=i, fab=j, lot=k or "", dcode=l or "",
-                         waybill=m or "")
-                    for a, b, c, e, f, g, h, i, j, k, l, m in cx.execute(
+                         waybill=m or "", memo=o or "")
+                    for a, b, c, e, f, g, h, i, j, k, l, m, o in cx.execute(
                         f"SELECT date,customer,part,qty,sales,doc,mcode,remark,fab,lot,"
-                        f"dcode,waybill "
+                        f"dcode,waybill,memo "
                         f"FROM log WHERE dir=? AND {sql} ORDER BY {order} "
                         f"LIMIT ?", [d] + args + [limit])]
             out[d] = dict(cnt=cnt, qty=round(qty), customers=custs,
@@ -449,13 +488,15 @@ def parse_shipmgmt(ws):
     출고 시트에 아예 빠진 거래처(한국전자판매·크래비스 등)까지 들어 있다.
     실측: 겹치는 기간에 출고 시트 4,959행 / 6,104만EA 대 이 시트 89,128행 / 9.7억EA.
     """
-    cols, out = {}, []
-    for r in ws.iter_rows(values_only=True):
+    cols, out, hdr = {}, [], []
+    mrows = memo_rows(ws)
+    for rn, r in enumerate(ws.iter_rows(values_only=True), start=1):
         if not r:
             continue
         keys = {_hkey(c) for c in r if clean(c)}
         if {"DATE", "CUSTOMER", "PART#"} <= keys:       # 헤더행
             cols = {_hkey(h): i for i, h in enumerate(r) if clean(h)}
+            hdr = list(r)
             continue
         if not cols:
             continue
@@ -477,6 +518,7 @@ def parse_shipmgmt(ws):
             # '.' 은 '해당 없음' 표기로 쓰이고 있어서 빈 값으로 본다
             lot="" if lot == "." else lot, dcode="" if dc == "." else dc,
             doc="", mcode="", remark="", fab="",
+            memo=memo_text(mrows, rn, hdr),
         ))
     return out
 
@@ -575,12 +617,13 @@ def log_day(office, date):
     cx = log_conn()
     try:
         rows = {"in": [], "out": []}
-        for d, cust, part, qty, sales, doc, remark, fab, lot, dc, wb_ in cx.execute(
-                f"SELECT dir,customer,part,qty,sales,doc,remark,fab,lot,dcode,waybill "
+        for d, cust, part, qty, sales, doc, remark, fab, lot, dc, wb_, mo in cx.execute(
+                f"SELECT dir,customer,part,qty,sales,doc,remark,fab,lot,dcode,waybill,memo "
                 f"FROM log WHERE {sql}", args):
             rows[d].append(dict(customer=cust, part=part, qty=qty, sales=sales,
                                 doc=doc, remark=remark, fab=fab, vendor="",
-                                lot=lot or "", dcode=dc or "", waybill=wb_ or ""))
+                                lot=lot or "", dcode=dc or "", waybill=wb_ or "",
+                                memo=mo or ""))
         # 비교 기준이 될 직전 영업일 (달력상 전날이 아니라 '자료가 있는 전날')
         prev = cx.execute(f"SELECT MAX(date) FROM log WHERE date<? AND {sc}",
                           [date] + sargs).fetchone()[0]
@@ -745,7 +788,11 @@ def parse_inventory(ws):
     if i_part < 0:
         return None
     # 시트 하단에 Part# 없는 합계 행이 섞여 있다. 그대로 더하면 정확히 2배가 된다.
-    data = [r for r in rows[2:] if r and i_part < len(r) and clean(r[i_part])]
+    # 메모를 붙이려면 엑셀 행번호가 필요하다 — rows[2:] 의 j 번째가 엑셀 j+3 행.
+    data2 = [(j + 3, r) for j, r in enumerate(rows[2:])
+             if r and i_part < len(r) and clean(r[i_part])]
+    data = [r for _, r in data2]
+    mrows = memo_rows(ws)
 
     def idx(*names):
         for n in names:
@@ -796,7 +843,7 @@ def parse_inventory(ws):
     dc = {y: [0, 0.0] for y in years}
     cust_bk = defaultdict(float)
 
-    for r in data:
+    for rn, r in data2:
         if not r or not clean(g(r, "part")):
             continue
         q = to_num(g(r, "qty"))
@@ -832,6 +879,7 @@ def parse_inventory(ws):
             vender=clean(g(r, "vender")), office=clean(g(r, "office")),
             sales=clean(g(r, "sales")), customer=c, crd=clean(g(r, "crd")),
             qty=q, avail=a, booking=b, old=old_q, oldest=oldest, dcq=dq,
+            memo=memo_text(mrows, rn, hdr),
         ))
 
     def top(k):
@@ -884,11 +932,13 @@ def day_block(date, inbound, outbound):
         sales=[dict(name=k, cnt=v) for k, v in top_sales],
         highlight=(dict(customer=hl["customer"], part=hl["part"], qty=round(hl["qty"]), sales=hl["sales"]) if hl else None),
         in_rows=[dict(part=r["part"], qty=round(r["qty"]), customer=r["customer"],
-                      sales=r["sales"], fab=r["fab"], remark=r["remark"]) for r in inbound],
+                      sales=r["sales"], fab=r["fab"], remark=r["remark"],
+                      memo=r.get("memo", "")) for r in inbound],
         out_rows=[dict(customer=r["customer"], part=r["part"], qty=round(r["qty"]),
                        sales=r["sales"], doc=r.get("doc", ""), remark=r.get("remark", ""),
                        vendor=r.get("vendor", ""), lot=r.get("lot", ""),
-                       dcode=r.get("dcode", ""), waybill=r.get("waybill", ""))
+                       dcode=r.get("dcode", ""), waybill=r.get("waybill", ""),
+                       memo=r.get("memo", ""))
                   for r in outbound],
     )
 
@@ -910,10 +960,48 @@ def open_wb(raw, password):
         raise ValueError("엑셀을 열 수 없습니다. 비밀번호가 비었거나 틀렸을 수 있어요 — 업로드 화면의 '비밀번호' 칸에 입력하세요 (예: 9178).")
 
 
-def office_block(name, per):
+def fill_days_from_log(per, by_dir):
+    """날짜 시트의 입고/출고 섹션이 비어 있으면 같은 워크북의 누적 시트로 채운다.
+
+    현장 운영이 이렇다: 날짜 시트는 아침에 틀만 만들어 두고(NO·DATE 만 채운 빈 행),
+    입고 행은 그날 늦게 적는다. 그 사이에 파일을 올리면 하루 보기 입고가 0 으로 뜬다
+    (영업5실 2026-09-04 실측: 아침 업로드 시 입고 0행 / 같은 시트 오후 10행).
+
+    누적 '입고'/'출고' 시트에 그 날짜 행이 이미 있으면 그것으로 채운다.
+    누적에도 없으면 그대로 0 이다 — 없는 값을 지어내지 않는다.
+
+    반환: (보완된 per, {날짜: ['in','out']})
+    """
+    idx = {}
+    for d, rows in (by_dir or {}).items():
+        by_date = defaultdict(list)
+        for r in rows:
+            if r.get("date"):
+                by_date[r["date"]].append(r)
+        idx[d] = by_date
+
+    out, filled = {}, defaultdict(list)
+    for date, (inb, outb) in per.items():
+        if not inb:
+            got = idx.get("in", {}).get(date)
+            if got:
+                inb = got
+                filled[date].append("in")
+        if not outb:
+            got = idx.get("out", {}).get(date)
+            if got:
+                outb = got
+                filled[date].append("out")
+        out[date] = (inb, outb)
+    return out, dict(filled)
+
+
+def office_block(name, per, filled=None):
     """{날짜:(inb,outb)} → 실 1개 대시보드 데이터."""
     dates = sorted(per)
     days = [day_block(d, per[d][0], per[d][1]) for d in dates]
+    for d in days:                                  # 누적 시트로 채운 날은 화면에 밝힌다
+        d["filled"] = (filled or {}).get(d["date"], [])
     return dict(name=name, dates=dates, today_idx=len(days) - 1, days=days)
 
 
@@ -996,7 +1084,7 @@ def build_payload(files, password):
       '~ inventory' 시트 있음      → 재고 현황 파일
     재고도 실별로 보관한다. (전에는 하나만 남아 마지막 파일이 앞의 것을 덮어썼다)
     """
-    raw_offices, inventories = [], {}     # [(실이름, {날짜:(inb,outb)})]
+    raw_offices, inventories = [], {}     # [(실이름, {날짜:(inb,outb)}, 보완표시)]
     logs = {}                             # 실이름 → {'in': [...], 'out': [...]} 누적 이력
     ships = []                            # 선적 리포트 행 (PO# → 발주업체)
     shipmgmt = []                         # 전사 출고 원장 스냅샷 [(파일명, 행들)]
@@ -1006,9 +1094,15 @@ def build_payload(files, password):
         try:
             per = parse_workbook(wb)
             if per:                                     # 입출고 파일
-                raw_offices.append((name, per))
                 # 같은 파일의 누적 시트 = 기간 조회용 이력 (날짜 시트는 2일치뿐이라)
                 logs[name] = {d: parse_log(wb[s]) for d, s in log_sheets(wb).items()}
+                # 날짜 시트 입고/출고 섹션이 비어 있으면 누적 시트로 채운다
+                per, filled = fill_days_from_log(per, logs[name])
+                if filled:
+                    for dt, dirs in sorted(filled.items()):
+                        print(f"[보완] {name} {dt} — 날짜 시트가 비어 누적 시트로 채움: "
+                              f"{'·'.join(dirs)}")
+                raw_offices.append((name, per, filled))
                 continue
             ws = inventory_sheet(wb)                    # 재고 파일
             if ws is not None:
@@ -1040,7 +1134,7 @@ def build_payload(files, password):
     # ---- 거래처 표기 통일 (Mobis / MOBIS → 가장 많이 쓰인 표기 하나로) ----
     # 파일 전체를 본 뒤에야 대표 표기를 고를 수 있어 여기서 일괄 처리한다.
     C = Companies()
-    for _, per in raw_offices:
+    for _, per, _f in raw_offices:
         for inb, outb in per.values():
             for r in inb + outb:
                 C.add(r.get("customer"))
@@ -1055,7 +1149,7 @@ def build_payload(files, password):
         for it in inv["items"]:
             C.add(it.get("customer"))
 
-    for _, per in raw_offices:
+    for _, per, _f in raw_offices:
         for inb, outb in per.values():
             for r in inb + outb:
                 r["customer"] = C.canon(r.get("customer"))
@@ -1085,8 +1179,8 @@ def build_payload(files, password):
 
     offices = []
     allbydate = defaultdict(lambda: ([], []))
-    for name, per in raw_offices:
-        offices.append(office_block(name, per))
+    for name, per, filled in raw_offices:
+        offices.append(office_block(name, per, filled))
         for d, (inb, outb) in per.items():
             allbydate[d][0].extend(inb); allbydate[d][1].extend(outb)
 
@@ -1226,17 +1320,19 @@ def export_xlsx(payload):
               widths=[20, 30])
         sheet("출고", f"출고 이력 · {office} · {span}",
               ["#", "일자", "거래처", "PART#", "수량", "담당", "lot number", "DATECODE",
-               "운송장번호", "문서번호", "비고"],
+               "운송장번호", "문서번호", "비고", "메모"],
               [[i + 1, r["date"], r["customer"], r["part"], r["qty"],
-                r["sales"], r["lot"], r["dcode"], r["waybill"], r["doc"], r["remark"]]
+                r["sales"], r["lot"], r["dcode"], r["waybill"], r["doc"], r["remark"],
+                r.get("memo", "")]
                for i, r in enumerate(res["out"]["rows"])],
-              widths=[6, 13, 22, 26, 12, 10, 22, 12, 18, 16, 22])
+              widths=[6, 13, 22, 26, 12, 10, 22, 12, 18, 16, 22, 40])
         sheet("입고", f"입고 이력 · {office} · {span}",
-              ["#", "일자", "거래처/공급", "PART#", "수량", "담당", "SR#", "FAB", "비고"],
+              ["#", "일자", "거래처/공급", "PART#", "수량", "담당", "SR#", "FAB", "비고",
+               "메모"],
               [[i + 1, r["date"], r["customer"], r["part"], r["qty"],
-                r["sales"], r["doc"], r["fab"], r["remark"]]
+                r["sales"], r["doc"], r["fab"], r["remark"], r.get("memo", "")]
                for i, r in enumerate(res["in"]["rows"])],
-              widths=[6, 13, 22, 26, 12, 10, 16, 10, 22])
+              widths=[6, 13, 22, 26, 12, 10, 16, 10, 22, 40])
     else:
         day = payload["day"]
         k = day.get("kpi", {})
@@ -1248,18 +1344,19 @@ def export_xlsx(payload):
               widths=[20, 16])
         sheet("출고", f"출고 내역 · {office} · {day.get('date','')}",
               ["#", "거래처", "PART#", "수량", "담당", "lot number", "DATECODE",
-               "운송장번호", "문서번호", "비고"],
+               "운송장번호", "문서번호", "비고", "메모"],
               [[i + 1, r.get("customer"), r.get("part"), r.get("qty"),
                 r.get("sales"), r.get("lot", ""), r.get("dcode", ""),
-                r.get("waybill", ""), r.get("doc"), r.get("remark")]
+                r.get("waybill", ""), r.get("doc"), r.get("remark"),
+                r.get("memo", "")]
                for i, r in enumerate(day.get("out_rows", []))],
-              widths=[6, 22, 26, 12, 10, 22, 12, 18, 16, 22])
+              widths=[6, 22, 26, 12, 10, 22, 12, 18, 16, 22, 40])
         sheet("입고", f"입고 내역 · {office} · {day.get('date','')}",
-              ["#", "거래처/공급", "PART#", "수량", "담당", "FAB", "비고"],
+              ["#", "거래처/공급", "PART#", "수량", "담당", "FAB", "비고", "메모"],
               [[i + 1, r.get("customer"), r.get("part"), r.get("qty"),
-                r.get("sales"), r.get("fab"), r.get("remark")]
+                r.get("sales"), r.get("fab"), r.get("remark"), r.get("memo", "")]
                for i, r in enumerate(day.get("in_rows", []))],
-              widths=[6, 22, 26, 12, 10, 10, 22])
+              widths=[6, 22, 26, 12, 10, 10, 22, 40])
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1931,6 +2028,12 @@ tr.oldrow td{background:#fdf1f1;}
 td.old{color:var(--red);font-weight:800;}
 th.old{color:var(--red);}                     /* 장기재고에 해당하는 Datecode 연도 칼럼 */
 td.dcy,th.dcy{white-space:nowrap;padding-left:9px;padding-right:9px;}
+/* 메모(엑셀 셀 메모)는 datecode 나열처럼 긴 게 섞여 있다 — 줄여 보여주고 전체는 툴팁 */
+.fillnote{margin:10px 0 0;padding:9px 14px;border-radius:8px;background:#f4f6f7;
+  border-left:3px solid #b9bec3;color:#5f666d;font-size:12px;line-height:1.5;}
+.fillnote b{color:#343a40;}
+td.memo{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:#8a6d3b;background:#fffdf5;cursor:help;}
 td.nw{white-space:nowrap;}                    /* 칼럼이 늘어난 재고 표에서 줄바꿈 방지 */
 .warn{color:var(--amber);font-weight:900;margin-left:4px;cursor:help;}
 /* 재고 표는 Datecode 연도 칼럼이 붙어 18칸이 된다 — 1280px 안에서는 뒤쪽 연도가 잘려서
@@ -2067,6 +2170,7 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
 
     <div class="kpis" id="kpis"></div>
     <div class="hl" id="hl" style="display:none"></div>
+    <div class="fillnote" id="fillnote" style="display:none"></div>
     <div class="tabs">
       <button class="tabbtn on" id="tb-out" onclick="showTab('out')">출고 내역<span class="n" id="n-out"></span></button>
       <button class="tabbtn" id="tb-in" onclick="showTab('in')">입고 내역<span class="n" id="n-in"></span></button>
@@ -2448,6 +2552,16 @@ function renderDay(day, prev, tag, idx){
       <div class="txt"><b>${esc(h.customer)}</b> 에 <b>${esc(h.part)}</b> <span class="q">${fmt(h.qty)}</span> EA 출고 · 담당 ${esc(h.sales)}</div>`;
   } else hlEl.style.display='none';
 
+  // 날짜 시트가 비어 누적 시트로 채운 날은 숫자의 출처를 밝힌다
+  const fnEl=document.getElementById('fillnote');
+  const fl=(day.filled||[]);
+  if(fl.length){
+    const ko={in:'입고',out:'출고'};
+    fnEl.style.display='block';
+    fnEl.innerHTML=`이 날짜의 <b>${fl.map(x=>ko[x]||x).join(' · ')}</b> 는 날짜 시트가 비어 있어 `
+      +`같은 파일의 <b>누적 ${fl.map(x=>ko[x]||x).join('/')} 시트</b>에서 가져왔습니다.`;
+  } else fnEl.style.display='none';
+
   CURDAY=day;                               // 정렬·검색이 다시 그릴 때 쓸 현재 하루
   buildSummary(day, prev, tag);
   drawDayCharts(day); buildTables(day); showTab(TBcur);
@@ -2530,11 +2644,14 @@ function buildSummary(day, prev, tag){
 function emptyMsg(){return '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">이 날짜의 내역이 없습니다</div>';}
 function noHit(){return '<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">조건에 맞는 내역이 없습니다</div>';}
 
-const IO_ALL=r=>[r.customer,r.part,r.sales,r.doc,r.remark,r.fab,r.lot,r.dcode,r.waybill];
+const IO_ALL=r=>[r.customer,r.part,r.sales,r.doc,r.remark,r.fab,r.lot,r.dcode,r.waybill,r.memo];
 // lot·DATECODE 는 shipping management 에서만, 운송장번호는 날짜 시트에서만 온다.
 // 값이 있는 표에서만 칼럼을 띄운다 — 빈 칸만 늘어놓지 않도록.
 const hasLot=rows=>rows.some(r=>r.lot||r.dcode);
 const hasWb =rows=>rows.some(r=>r.waybill);
+// 메모 칸은 내용이 하나라도 있을 때만 낸다 (메모 안 쓰는 실에서 빈 칸이 늘지 않게)
+const hasMemo=rows=>rows.some(r=>r.memo);
+const memoTd=v=>'<td class="memo" title="'+esc(v||'')+'">'+(esc(v||'')||'&mdash;')+'</td>';
 let DSORT={k:'',d:0};                      // 하루 보기 정렬 (기본 = 엑셀 순서)
 let CURDAY=null;                           // 지금 보고 있는 하루 (파일의 날짜일 수도, 달력으로 고른 과거일 수도)
 
@@ -2553,16 +2670,17 @@ function buildTables(day){
   const S=(l,k,c)=>th(l,k,DSORT,'sortDay',c);
   const empty=day.out_rows.length||day.in_rows.length?noHit():emptyMsg();
   const L=hasLot(day.out_rows), W=hasWb(day.out_rows);
-  const out=!outR.length?empty:`<table><thead><tr><th>#</th>${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):''}${W?S('운송장번호','waybill'):''}${L?'':S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
+  const MO=hasMemo(day.out_rows), MI=hasMemo(day.in_rows);
+  const out=!outR.length?empty:`<table><thead><tr><th>#</th>${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):''}${W?S('운송장번호','waybill'):''}${L?'':S('문서번호','doc')}${S('비고','remark')}${MO?S('메모','memo'):''}</tr></thead><tbody>${
     outR.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
       <td class="qty">${fmt(r.qty)}</td><td>${esc(r.sales)}</td>
       ${L?`<td class="po">${esc(r.lot)||'—'}</td><td class="dt">${esc(r.dcode)||'—'}</td>`:''}
       ${W?`<td class="po">${esc(r.waybill)||'—'}</td>`:''}
-      ${L?'':`<td>${esc(r.doc)||'—'}</td>`}<td style="color:#888">${esc(r.remark)||''}</td></tr>`).join('')}</tbody></table>`;
-  const inn=!inR.length?empty:`<table><thead><tr><th>#</th>${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}</tr></thead><tbody>${
+      ${L?'':`<td>${esc(r.doc)||'—'}</td>`}<td style="color:#888">${esc(r.remark)||''}</td>${MO?memoTd(r.memo):''}</tr>`).join('')}</tbody></table>`;
+  const inn=!inR.length?empty:`<table><thead><tr><th>#</th>${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}${MI?S('메모','memo'):''}</tr></thead><tbody>${
     inR.map((r,i)=>`<tr><td class="n">${i+1}</td><td><b>${esc(r.customer)||'—'}</b></td><td class="part">${esc(r.part)}</td>
       <td class="qty">${fmt(r.qty)}</td><td>${esc(r.sales)}</td><td>${esc(r.fab)?'<span class="pill">FAB '+esc(r.fab)+'</span>':'—'}</td>
-      <td style="color:#888">${esc(r.remark)||''}</td></tr>`).join('')}</tbody></table>`;
+      <td style="color:#888">${esc(r.remark)||''}</td>${MI?memoTd(r.memo):''}</tr>`).join('')}</tbody></table>`;
   TB={out,in:inn};
 }
 
@@ -2585,10 +2703,10 @@ function showTab(which){
 // 3,000행 상한이 걸린 뒤 화면에서 정렬하면 그 3,000행 안에서만 섞이기 때문이다.
 const F_IO =[['all','전체'],['customer','거래처'],['part','PART#'],
              ['sales','담당'],['waybill','운송장번호'],['doc','문서번호'],
-             ['lot','lot number'],['dcode','DATECODE'],['remark','비고']];
+             ['lot','lot number'],['dcode','DATECODE'],['remark','비고'],['memo','메모']];
 const F_INV=[['all','전체'],['part','PART#'],['customer','PO# / 고객'],['buyer','발주업체'],
              ['mobis','MOBIS ID'],['family','FAMILY'],['vender','VENDER'],
-             ['sales','담당'],['office','실']];
+             ['sales','담당'],['office','실'],['memo','메모']];
 
 function fillFields(prefix, fields, d1, d2){
   const opt=f=>fields.map(([v,l])=>`<option value="${v}"${v===f?' selected':''}>${l}</option>`).join('');
@@ -2730,21 +2848,22 @@ function renderLog(){
     기간을 좁히거나 검색 조건을 넣어 보세요. <b>⬇ Excel 내보내기는 전체가 나갑니다.</b></div>`:'';
   const S=(l,k,c)=>th(l,k,LSORT,'sortLog',c);
   const L=hasLot(r.out.rows), W=hasWb(r.out.rows);
+  const MO=hasMemo(r.out.rows), MI=hasMemo(r.in.rows);
 
   TB={
-    out: !r.out.rows.length?none:cap(r.out)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):''}${W?S('운송장번호','waybill'):''}${L?'':S('문서번호','doc')}${S('비고','remark')}</tr></thead><tbody>${
+    out: !r.out.rows.length?none:cap(r.out)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${L?S('lot number','lot')+S('DATECODE','dcode'):''}${W?S('운송장번호','waybill'):''}${L?'':S('문서번호','doc')}${S('비고','remark')}${MO?S('메모','memo'):''}</tr></thead><tbody>${
       r.out.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
         <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
         <td class="qty">${fmt(x.qty)}</td><td>${esc(x.sales)}</td>
         ${L?`<td class="po">${esc(x.lot)||'—'}</td><td class="dt">${esc(x.dcode)||'—'}</td>`:''}
         ${W?`<td class="po">${esc(x.waybill)||'—'}</td>`:''}
-        ${L?'':`<td>${esc(x.doc)||'—'}</td>`}<td style="color:#888">${esc(x.remark)||''}</td></tr>`).join('')}</tbody></table>`,
-    in: !r.in.rows.length?none:cap(r.in)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}</tr></thead><tbody>${
+        ${L?'':`<td>${esc(x.doc)||'—'}</td>`}<td style="color:#888">${esc(x.remark)||''}</td>${MO?memoTd(x.memo):''}</tr>`).join('')}</tbody></table>`,
+    in: !r.in.rows.length?none:cap(r.in)+`<table><thead><tr><th>#</th>${S('일자','date')}${S('거래처/공급','customer')}${S('PART#','part')}${S('수량','qty','n')}${S('담당','sales')}${S('FAB','fab')}${S('비고','remark')}${MI?S('메모','memo'):''}</tr></thead><tbody>${
       r.in.rows.map((x,i)=>`<tr><td class="n">${i+1}</td><td class="dt">${esc(x.date)}</td>
         <td><b>${esc(x.customer)||'—'}</b></td><td class="part">${esc(x.part)}</td>
         <td class="qty">${fmt(x.qty)}</td><td>${esc(x.sales)}</td>
         <td>${esc(x.fab)?'<span class="pill">FAB '+esc(x.fab)+'</span>':'—'}</td>
-        <td style="color:#888">${esc(x.remark)||''}</td></tr>`).join('')}</tbody></table>`,
+        <td style="color:#888">${esc(x.remark)||''}</td>${MI?memoTd(x.memo):''}</tr>`).join('')}</tbody></table>`,
   };
   showTab(TBcur);
 }
@@ -3107,7 +3226,7 @@ function sortInv(key){ nextDir(ISORT,key); drawInvTable(); }
 function clearInvSearch(){ clearFields('inv'); drawInvTable(); }
 
 // '발주업체' 로 검색하려면 조인 결과가 행에 있어야 한다 — 필터 직전에 붙여 둔다
-const INV_ALL=x=>[x.part,x.mobis,x.family,x.vender,x.sales,x.customer,x.pn,x.office,x.buyer];
+const INV_ALL=x=>[x.part,x.mobis,x.family,x.vender,x.sales,x.customer,x.pn,x.office,x.buyer,x.memo];
 
 function drawInvTable(){
   const I=INVS[INVK];
@@ -3148,13 +3267,14 @@ function drawInvTable(){
   const hasVen=new Set(I.items.map(x=>x.vender).filter(Boolean)).size>1;
   // 발주업체 칼럼은 선적 리포트를 올렸고 실제로 붙는 게 있을 때만 (영업1,2실은 전부 빈칸이라 뺀다)
   const hasBuyer=POROWS>0 && base.some(x=>x.buyer);
+  const MM=hasMemo(base);
   const S=(l,k,c)=>th(l,k,ISORT,'sortInv',c);
   const YH=YRS.map(y=>S('DC '+y,'y'+y,'n dcy'+(y<=OY?' old':''))).join('');
   const YC=x=>YRS.map(y=>`<td class="n dcy${y<=OY&&x['y'+y]?' old':''}">${x['y'+y]?fmt(x['y'+y]):'—'}</td>`).join('');
   el.innerHTML=`<table><thead><tr><th class="stk1">#</th>${S('PART#','part','stk2')}${S(poHeader(I.items),'customer')}${hasBuyer?S('발주업체','buyer'):''}
     ${S('MOBIS ID','mobis')}${S('FAMILY','family')}${hasVen?S('VENDER','vender'):''}
     ${S('실','office')}${S('재고','qty','n')}${S('가용','avail','n')}${S('예약','booking','n')}
-    ${YH}${legacy?S('장기재고','old','n')+S('Datecode','oldest'):''}${S('담당','sales')}</tr></thead><tbody>${
+    ${YH}${legacy?S('장기재고','old','n')+S('Datecode','oldest'):''}${S('담당','sales')}${MM?S('메모','memo'):''}</tr></thead><tbody>${
     rows.map((x,i)=>`<tr class="${dc&&x.old>0?'oldrow':''}">
       <td class="n stk1">${i+1}</td>
       <td class="part stk2">${esc(x.part)}</td>
@@ -3170,7 +3290,7 @@ function drawInvTable(){
       ${YC(x)}
       ${legacy?`<td class="n ${x.old>0?'old':''}">${x.old?fmt(x.old):'—'}</td>
       <td>${x.oldest?('<span class="pill">'+x.oldest+'~</span>'):'—'}</td>`:''}
-      <td>${esc(x.sales)||'—'}</td></tr>`).join('')}</tbody></table>`;
+      <td>${esc(x.sales)||'—'}</td>${MM?memoTd(x.memo):''}</tr>`).join('')}</tbody></table>`;
   fixSticky();
 }
 

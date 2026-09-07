@@ -40,6 +40,22 @@ def _col_idx(ref):
     return n - 1
 
 
+def _resolve(base_dir, target):
+    """rels 의 Target 을 zip 안 경로로 편다. '../comments2.xml' → 'xl/comments2.xml'."""
+    if target.startswith("/"):
+        return target[1:]
+    out = []
+    for p in (base_dir.split("/") + target.split("/")):
+        if p in ("", "."):
+            continue
+        if p == "..":
+            if out:
+                out.pop()
+        else:
+            out.append(p)
+    return "/".join(out)
+
+
 def _is_date_fmt(code):
     """서식 문자열이 날짜/시간인가. 리터럴('원', [red] 등)은 빼고 본다."""
     return bool(_DATE_CHARS.search(_ESCAPED.sub("", (code or "").lower())))
@@ -52,6 +68,7 @@ class FastWorkbook:
         self.z = zipfile.ZipFile(fileobj)
         self._strings = None
         self._date_xf = None
+        self._comments = {}                         # 시트명 -> {(행, 칸): 메모}
 
         wb = ET.fromstring(self.z.read("xl/workbook.xml"))
         rels = ET.fromstring(self.z.read("xl/_rels/workbook.xml.rels"))
@@ -113,6 +130,61 @@ class FastWorkbook:
             self._date_xf = xf
         return self._date_xf
 
+    # ---- 셀 메모 (엑셀 '메모/노트') ----
+    # 시트 XML 이 아니라 xl/comments*.xml 에 따로 들어 있다. 파일이 작아서(수십 KB)
+    # 시트 본문을 다시 훑지 않고 그것만 읽으면 된다.
+    def comments(self, name):
+        if name in self._comments:
+            return self._comments[name]
+        out = {}
+        path = self._paths.get(name)
+        if path:
+            base = path.rsplit("/", 1)
+            rel = "%s/_rels/%s.rels" % (base[0], base[-1]) if len(base) > 1 else None
+            cpath = None
+            if rel:
+                try:
+                    root = ET.fromstring(self.z.read(rel))
+                except (KeyError, ET.ParseError):
+                    root = None
+                if root is not None:
+                    for r in root:
+                        t = r.get("Target") or ""
+                        if re.search(r"comments\d*\.xml$", t.rsplit("/", 1)[-1]):
+                            cpath = _resolve(base[0], t)
+                            break
+            if cpath:
+                try:
+                    croot = ET.fromstring(self.z.read(cpath))
+                except (KeyError, ET.ParseError):
+                    croot = None
+                if croot is not None:
+                    authors = [(a.text or "").strip() for a in croot.iter(NS + "author")]
+                    for c in croot.iter(NS + "comment"):
+                        ref = c.get("ref") or ""
+                        txt = " ".join("".join(
+                            t.text or "" for t in c.iter(NS + "t")).split())
+                        if not txt:
+                            continue
+                        # 첫 런이 작성자 이름이라 '작성자:' 접두어가 붙어 나온다 — 떼어 낸다
+                        try:
+                            ai = int(c.get("authorId") or -1)
+                        except ValueError:
+                            ai = -1
+                        who = authors[ai] if 0 <= ai < len(authors) else ""
+                        for a in ([who] if who else []) + authors:
+                            if a and txt.startswith(a + ":"):
+                                txt = txt[len(a) + 1:].strip()
+                                break
+                        if not txt:
+                            continue
+                        m = re.match(r"([A-Z]+)(\d+)$", ref)
+                        if not m:
+                            continue
+                        out[(int(m.group(2)), _col_idx(ref))] = txt
+        self._comments[name] = out
+        return out
+
     def __getitem__(self, name):
         return FastSheet(self, name)
 
@@ -125,6 +197,11 @@ class FastSheet:
         self.wb = wb
         self.name = name
         self.title = name
+
+    @property
+    def comments(self):
+        """{(엑셀 행번호, 0-based 칸번호): 메모 내용}"""
+        return self.wb.comments(self.name)
 
     def iter_rows(self, min_row=1, max_row=None, values_only=True):
         """openpyxl 과 같은 모양. 빈 행도 건너뛰지 않고 채워서 낸다
