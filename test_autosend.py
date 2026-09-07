@@ -92,6 +92,52 @@ class TestSendOfficeEmails(unittest.TestCase):
         self.assertEqual(res["ok"], ["영업1,2실"], "앞의 실이 실패해도 뒤의 실은 나간다")
 
 
+class TestTodayIndex(unittest.TestCase):
+    """메일 제목 날짜가 하루 앞서던 문제.
+
+    현장에서 다음 날 시트를 빈 틀로 미리 만들어 두는 바람에 마지막 시트 = 내일이
+    됐다 (실측: 2026-09-03 18:17 발송, 제목은 2026-09-04).
+    """
+
+    def test_skips_tomorrows_sheet(self):
+        with mock.patch.object(app, "today_kst", return_value="2026-09-03"):
+            self.assertEqual(app.today_index(["2026-09-03", "2026-09-04"]), 0)
+
+    def test_takes_todays_sheet_when_it_arrives(self):
+        with mock.patch.object(app, "today_kst", return_value="2026-09-04"):
+            self.assertEqual(app.today_index(["2026-09-03", "2026-09-04"]), 1)
+
+    def test_falls_back_to_last_when_all_future(self):
+        """날짜를 잘못 적은 파일 — 화면이 비는 것보다 마지막 시트가 낫다."""
+        with mock.patch.object(app, "today_kst", return_value="2026-09-03"):
+            self.assertEqual(app.today_index(["2026-09-05", "2026-09-06"]), 1)
+
+    def test_stale_file_keeps_its_last_day(self):
+        """며칠 지난 파일을 다시 열어도 마지막 자료일이 오늘 자리다."""
+        with mock.patch.object(app, "today_kst", return_value="2026-09-07"):
+            self.assertEqual(app.today_index(["2026-09-02", "2026-09-03"]), 1)
+
+    def test_kst_not_server_utc(self):
+        """Render 는 UTC 로 돈다. 한국 아침 8시(=UTC 전날 23시) 업로드에서
+        오늘 시트가 미래로 밀리면 안 된다."""
+        import datetime as dt
+        fixed = dt.datetime(2026, 9, 3, 23, 0, tzinfo=dt.timezone.utc)
+
+        class FakeDT(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed.astimezone(tz) if tz else fixed
+
+        with mock.patch.object(app.datetime, "datetime", FakeDT):
+            self.assertEqual(app.today_kst(), "2026-09-04")
+
+    def test_office_block_uses_it(self):
+        with mock.patch.object(app, "today_kst", return_value="2026-09-03"):
+            blk = app.office_block("영업5실", {"2026-09-03": ([], []), "2026-09-04": ([], [])})
+        self.assertEqual(blk["today_idx"], 0)
+        self.assertEqual(blk["days"][blk["today_idx"]]["date"], "2026-09-03")
+
+
 class TestNoSmtpConfigured(unittest.TestCase):
     def test_reports_not_configured_instead_of_silently_passing(self):
         with mock.patch.object(app, "resolve_smtp", return_value=None):

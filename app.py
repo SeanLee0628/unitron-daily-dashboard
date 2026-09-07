@@ -996,13 +996,37 @@ def fill_days_from_log(per, by_dir):
     return out, dict(filled)
 
 
+KST = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def today_kst():
+    """오늘 날짜(한국). 서버가 UTC(Render)로 돌아도 현장 날짜를 쓴다."""
+    return datetime.datetime.now(KST).strftime("%Y-%m-%d")
+
+
+def today_index(dates):
+    """'오늘' 로 볼 날짜 시트의 위치.
+
+    마지막 시트를 그냥 오늘로 잡으면 안 된다 — 현장에서 다음 날 시트를 빈 틀로 미리
+    만들어 두기 때문에 아직 오지 않은 날짜가 오늘이 돼 버린다 (실측: 2026-09-03
+    18:17 에 나간 영업5실 메일 제목이 2026-09-04). 한국 날짜로 오늘을 넘지 않는
+    마지막 시트를 고른다. 전부 미래면(날짜를 잘못 적은 파일) 마지막 시트를 그대로
+    쓴다 — 화면이 비는 것보다 낫다.
+    """
+    if not dates:
+        return 0
+    today = today_kst()
+    past = [i for i, d in enumerate(dates) if d <= today]
+    return past[-1] if past else len(dates) - 1
+
+
 def office_block(name, per, filled=None):
     """{날짜:(inb,outb)} → 실 1개 대시보드 데이터."""
     dates = sorted(per)
     days = [day_block(d, per[d][0], per[d][1]) for d in dates]
     for d in days:                                  # 누적 시트로 채운 날은 화면에 밝힌다
         d["filled"] = (filled or {}).get(d["date"], [])
-    return dict(name=name, dates=dates, today_idx=len(days) - 1, days=days)
+    return dict(name=name, dates=dates, today_idx=today_index(dates), days=days)
 
 
 ALL = "전체 합계"
