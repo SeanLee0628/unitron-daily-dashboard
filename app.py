@@ -1771,10 +1771,12 @@ SALES_EMAILS = {
         "martin@unitrontech.com",
         "sangil@unitrontech.com",
         "hs.yang@unitrontech.com",
+        # jyson(손진영). 4실 jysong 과 철자가 한 글자 다르지만 오타 아님.
         "jyson@unitrontech.com",
         "linday@unitrontech.com",
         "boeun.kim@unitrontech.com",
         "sw.lee@unitrontech.com",
+        "GBC118@unitrontech.com",
     ],
 }
 
