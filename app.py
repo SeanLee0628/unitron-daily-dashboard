@@ -1729,7 +1729,12 @@ DEFAULT_EMAILS = [
 
 # 전 실 참조(Cc). 실별로 나뉘지 않고 4개 실 메일을 모두 참조로 받는다.
 # 2026-09-09 — 명단 교체. 자재관리팀 sw.ahn 은 여기서 빠졌다.
+# 2026-09-10 — sw.ahn 을 다시 참조로 넣고 seanlee 도 추가했다.
+#   seanlee 는 DEFAULT_EMAILS(전 실 받는사람)에도 있어서 발송 직전 참조에서 걸러진다.
+#   (같은 사람이 받는사람+참조면 메일이 두 번 가므로 _send_smtp/_send_outlook 이 뺀다.)
 CC_EMAILS = [
+    "seanlee@unitrontech.com",
+    "sw.ahn@unitrontech.com",
     "nkc23@unitrontech.com",
     "gs.ha@unitrontech.com",
     "gy.choi@unitrontech.com",
@@ -1778,6 +1783,8 @@ SALES_EMAILS = {
         "mhlee@unitrontech.com",
         "yunah@unitrontech.com",
         "sjpark@unitrontech.com",
+        # 2026-09-10 — lindsay 추가 (5실은 linday@ 오타를 lindsay@ 로 정정).
+        "lindsay@unitrontech.com",
     ],
     # 2026-09-09 — 그룹 주소 sales1team@ 을 빼고 개인 주소로 전부 교체했다.
     # 그룹으로 보내면 4실이 아닌 사람에게도 퍼지는데 그걸 앱에서 막을 방법이 없다.
@@ -1793,6 +1800,8 @@ SALES_EMAILS = {
         "martin@unitrontech.com",
         "hs.yang@unitrontech.com",
         "sw.lee@unitrontech.com",
+        # 2026-09-10 — lindsay 추가 (5실은 linday@ 오타를 lindsay@ 로 정정).
+        "lindsay@unitrontech.com",
     ],
     # 2026-09-09 — 4실과 같은 이유로 그룹 주소 sales3team@ 을 빼고 개인 주소로 교체했다.
     "5": [
@@ -1808,7 +1817,8 @@ SALES_EMAILS = {
         "harold@unitrontech.com",
         "jysong@unitrontech.com",
         "sccho@unitrontech.com",
-        "linday@unitrontech.com",
+        # 2026-09-10 — linday@ 오타를 lindsay@ 로 고쳤다 (3·4실에도 추가).
+        "lindsay@unitrontech.com",
         "boeun.kim@unitrontech.com",
     ],
 }
