@@ -1761,13 +1761,19 @@ SALES_EMAILS = {
         "sccho@unitrontech.com",
         "sw.lee@unitrontech.com",
     ],
-    # 주소의 숫자는 실 번호와 일치하지 않는다 (5실→sales3team).
-    # 사내 계정 규칙이므로 번호가 어긋나 보여도 고치지 말 것.
+    # 2026-09-09 — 4실과 같은 이유로 그룹 주소 sales3team@ 을 빼고 개인 주소로 교체했다.
     "5": [
-        "sales3team@unitrontech.com",
-        # 2026-09-09 추가.
-        "GBC118@unitrontech.com",
+        "hw.kim@unitrontech.com",
+        "cj.lim@unitrontech.com",
+        "clark@unitrontech.com",
+        "jacob@unitrontech.com",
+        "hskang@unitrontech.com",
+        "martin@unitrontech.com",
+        "sangil@unitrontech.com",
         "hs.yang@unitrontech.com",
+        "jyson@unitrontech.com",
+        "linday@unitrontech.com",
+        "boeun.kim@unitrontech.com",
         "sw.lee@unitrontech.com",
     ],
 }
