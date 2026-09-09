@@ -1727,38 +1727,71 @@ DEFAULT_EMAILS = [
     "seanlee@unitrontech.com",
 ]
 
-# 전 실 참조(Cc). 2026-08-06 — 받는 사람이 아니라 참조로 간다.
-# gy.choi 는 이전까지 받는 사람이었고, sw.ahn 은 4·5실만 받았다. 둘 다 여기로 옮겼다.
+# 전 실 참조(Cc). 실별로 나뉘지 않고 4개 실 메일을 모두 참조로 받는다.
+# 2026-09-09 — 명단 교체. 자재관리팀 sw.ahn 은 여기서 빠졌다.
 CC_EMAILS = [
-    "sw.ahn@unitrontech.com",
+    "nkc23@unitrontech.com",
+    "gs.ha@unitrontech.com",
     "gy.choi@unitrontech.com",
     "bjsoh@unitrontech.com",
+    "haeun.yun@unitrontech.com",
+    "cs.kim@unitrontech.com",
+    "dhyoo@unitrontech.com",
 ]
 
 # 실 담당자. 2026-08-06 추가 — 각 실이 자기 실 자료를 직접 받는다.
 # 위 DEFAULT_EMAILS(전 실 공통 수신)는 그대로 유지되고 여기에 더해진다.
 SALES_EMAILS = {
+    # 2026-09-09 — 4·5실과 같은 이유로 그룹 주소 sales1@ 을 빼고 개인 주소로 전부 교체했다.
     "12": [
-        "sales1@unitrontech.com",
-        "sh.hong@unitrontech.com",
+        "jini@unitrontech.com",
+        "eric.lee@unitrontech.com",
+        "kate.lee@unitrontech.com",
+        "martin.kim@unitrontech.com",
+        "kyle.lee@unitrontech.com",
+        "jhunwon@unitrontech.com",
+        "seongwoo.ahn@unitrontech.com",
+        "ch.cho@unitrontech.com",
+        "djkim@unitrontech.com",
+        "rick.kim@unitrontech.com",
         "davidpark@unitrontech.com",
         "ys.jung@unitrontech.com",
         "trevis@unitrontech.com",
         "royola@unitrontech.com",
-        # 2026-08-25 추가.
         "henry.jeong@unitrontech.com",
+        "harold@unitrontech.com",
+        "jysong@unitrontech.com",
+        "sccho@unitrontech.com",
+        "sh.min@unitrontech.com",
+        "kaylen.choi@unitrontech.com",
+        "anna@unitrontech.com",
+        "sh.hong@unitrontech.com",
+        "songyi@unitrontech.com",
+        "sj.bong@unitrontech.com",
     ],
-    "3": ["sales3@unitrontech.com"],
+    # 2026-09-09 — 다른 실과 같은 이유로 그룹 주소 sales3@ 을 빼고 개인 주소로 교체했다.
+    "3": [
+        "bh.hwang@unitrontech.com",
+        "jayden@unitrontech.com",
+        "mason.lee@unitrontech.com",
+        "ji.yoon@unitrontech.com",
+        "mhlee@unitrontech.com",
+        "yunah@unitrontech.com",
+        "sjpark@unitrontech.com",
+    ],
     # 2026-09-09 — 그룹 주소 sales1team@ 을 빼고 개인 주소로 전부 교체했다.
     # 그룹으로 보내면 4실이 아닌 사람에게도 퍼지는데 그걸 앱에서 막을 방법이 없다.
     "4": [
         "hw.kim@unitrontech.com",
+        "sdpark@unitrontech.com",
         "yk.kwon@unitrontech.com",
-        "hjpark@unitrontech.com",
+        "hj.park@unitrontech.com",
         "hjgo@unitrontech.com",
         "harold@unitrontech.com",
         "jysong@unitrontech.com",
         "sccho@unitrontech.com",
+        "martin@unitrontech.com",
+        "hs.yang@unitrontech.com",
         "sw.lee@unitrontech.com",
     ],
     # 2026-09-09 — 4실과 같은 이유로 그룹 주소 sales3team@ 을 빼고 개인 주소로 교체했다.
@@ -1771,12 +1804,12 @@ SALES_EMAILS = {
         "martin@unitrontech.com",
         "sangil@unitrontech.com",
         "hs.yang@unitrontech.com",
-        # jyson(손진영). 4실 jysong 과 철자가 한 글자 다르지만 오타 아님.
         "jyson@unitrontech.com",
+        "harold@unitrontech.com",
+        "jysong@unitrontech.com",
+        "sccho@unitrontech.com",
         "linday@unitrontech.com",
         "boeun.kim@unitrontech.com",
-        "sw.lee@unitrontech.com",
-        "GBC118@unitrontech.com",
     ],
 }
 
