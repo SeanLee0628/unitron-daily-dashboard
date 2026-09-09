@@ -1749,15 +1749,27 @@ SALES_EMAILS = {
         "henry.jeong@unitrontech.com",
     ],
     "3": ["sales3@unitrontech.com"],
-    # 주소의 숫자는 실 번호와 일치하지 않는다 (4실→sales1team, 5실→sales3team).
-    # 사내 계정 규칙이므로 번호가 어긋나 보여도 고치지 말 것.
+    # 2026-09-09 — 그룹 주소 sales1team@ 을 빼고 개인 주소로 전부 교체했다.
+    # 그룹으로 보내면 4실이 아닌 사람에게도 퍼지는데 그걸 앱에서 막을 방법이 없다.
     "4": [
-        "sales1team@unitrontech.com",
-        # 2026-08-14 추가.
+        "hw.kim@unitrontech.com",
+        "yk.kwon@unitrontech.com",
+        "hjpark@unitrontech.com",
+        "hjgo@unitrontech.com",
+        "harold@unitrontech.com",
         "jysong@unitrontech.com",
         "sccho@unitrontech.com",
+        "sw.lee@unitrontech.com",
     ],
-    "5": ["sales3team@unitrontech.com"],
+    # 주소의 숫자는 실 번호와 일치하지 않는다 (5실→sales3team).
+    # 사내 계정 규칙이므로 번호가 어긋나 보여도 고치지 말 것.
+    "5": [
+        "sales3team@unitrontech.com",
+        # 2026-09-09 추가.
+        "GBC118@unitrontech.com",
+        "hs.yang@unitrontech.com",
+        "sw.lee@unitrontech.com",
+    ],
 }
 
 def _office_recipients(slug):
