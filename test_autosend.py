@@ -70,13 +70,49 @@ class TestSendOfficeEmails(unittest.TestCase):
                              "자재관리팀은 받는 사람이 아니라 참조다")
             self.assertIn("sw.ahn@unitrontech.com", sent["cc"] or [], "전 실 참조")
 
-    def test_4실_담당자가_받는다(self):
-        """실 담당자는 자기 실 메일에만 들어간다. 다른 실에 새면 안 된다."""
-        self.assertIn("jysong@unitrontech.com", app.OFFICE_EMAILS["4"])
-        self.assertIn("sccho@unitrontech.com", app.OFFICE_EMAILS["4"])
-        for slug in ("12", "3", "5"):
-            self.assertNotIn("jysong@unitrontech.com", app.OFFICE_EMAILS[slug])
-            self.assertNotIn("sccho@unitrontech.com", app.OFFICE_EMAILS[slug])
+    def test_한_실_담당자는_다른_실에_새지_않는다(self):
+        """한 실만 맡은 사람은 그 실 메일에만 들어간다.
+
+        원래 이 테스트는 jysong·sccho 를 4실 전용으로 못박았는데, 2026-09-09 에
+        두 사람이 1,2실·5실 담당자로도 들어가면서 계속 실패했다. 겸직은 실제
+        상황이니 테스트가 따라간다 — 대신 지키려던 것(자기 실 밖으로 안 샌다)은
+        한 실만 맡은 사람으로 검사한다.
+        """
+        전용 = {"12": "jini@unitrontech.com", "3": "bh.hwang@unitrontech.com",
+               "4": "sdpark@unitrontech.com", "5": "cj.lim@unitrontech.com"}
+        for slug, mail in 전용.items():
+            self.assertIn(mail, app.OFFICE_EMAILS[slug], f"{slug}실 담당자")
+            for other in set(app.OFFICE_EMAILS) - {slug}:
+                self.assertNotIn(mail, app.OFFICE_EMAILS[other],
+                                 f"{mail} 이 {other}실로 샜다")
+
+    def test_겸직자는_맡은_실_전부에_들어간다(self):
+        """여러 실을 맡은 사람은 그 실들에 모두 들어간다 (2026-09-09~10 명단)."""
+        for mail, slugs in {
+            "jysong@unitrontech.com": ("12", "4", "5"),
+            "sccho@unitrontech.com": ("12", "4", "5"),
+            "harold@unitrontech.com": ("12", "4", "5"),
+            "lindsay@unitrontech.com": ("3", "4", "5"),
+        }.items():
+            for slug in app.OFFICE_EMAILS:
+                (self.assertIn if slug in slugs else self.assertNotIn)(
+                    mail, app.OFFICE_EMAILS[slug], f"{mail} / {slug}실")
+
+    def test_그룹_주소는_쓰지_않는다(self):
+        """sales1@·sales3team@ 같은 그룹 주소로 보내면 그 실 밖으로 퍼지는데
+        앱에서 막을 방법이 없다. 2026-09-09 에 전부 개인 주소로 바꿨다."""
+        모든주소 = (app.DEFAULT_EMAILS + app.CC_EMAILS
+                 + [m for v in app.SALES_EMAILS.values() for m in v])
+        for mail in 모든주소:
+            local = mail.split("@")[0].lower()
+            self.assertFalse(local.startswith("sales") or local.endswith("team"),
+                             f"그룹 주소로 보이는 수신자: {mail}")
+
+    def test_오타_주소_linday_는_없다(self):
+        """5실에 linday@ 로 잘못 들어가 있었다 (2026-09-10 정정)."""
+        모든주소 = (app.DEFAULT_EMAILS + app.CC_EMAILS
+                 + [m for v in app.SALES_EMAILS.values() for m in v])
+        self.assertNotIn("linday@unitrontech.com", 모든주소)
 
     def test_uses_today_index_for_date(self):
         app.send_office_emails(SAMPLE, "https://dash.example.com")
