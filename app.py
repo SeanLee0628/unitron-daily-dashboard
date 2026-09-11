@@ -1514,18 +1514,25 @@ def export_xlsx(payload):
         # 샘플 시트가 있는 실만. 보유중 → 출고완료 순으로, 각각 입고일 최신순.
         smp = inv.get("samples")
         if smp and smp["rows"]:
-            srows = sorted(smp["rows"],
-                           key=lambda x: (not x["held"], str(x.get("indate") or "")),
-                           reverse=False)
-            srows = ([x for x in srows if x["held"]][::-1]
-                     + [x for x in srows if not x["held"]][::-1])
+            # 행은 빈 칸을 빼고 오므로(parse_samples 의 tight) 반드시 .get 으로 읽는다
+            def sv(x, k):
+                return x.get(k, "")
+            srows = sorted(smp["rows"], key=lambda x: str(sv(x, "indate")), reverse=True)
+            srows = ([x for x in srows if x.get("held")]
+                     + [x for x in srows if not x.get("held")])
+            # 여러 실을 함께 볼 때만 '실' 칸 — 화면 표와 같은 규칙
+            multi = len({sv(x, "office") for x in srows}) > 1
             sheet("샘플", f"샘플 현황 · {office}  (보유 {smp['held_n']}건 / 전체 {smp['n']}건)",
                   ["품번", "입고확인", "SR# / PO#", "Qty", "신청SALES", "입고일",
-                   "출고일", "출고수량", "출고SALES", "비고", "위치", "확인필요"],
-                  [[x["part"], x["status"], x["sr"], x["qty"], x["sales"], x["indate"],
-                    x["outdate"], x["outqty"], x["outsales"], x["remark"], x["loc"],
-                    "⚠" if x["odd"] else ""] for x in srows],
-                  widths=[26, 10, 18, 10, 12, 12, 12, 10, 12, 20, 12, 10])
+                   "출고일", "출고수량", "출고SALES", "비고", "위치", "확인필요"]
+                  + (["실"] if multi else []),
+                  [[sv(x, "part"), sv(x, "status"), sv(x, "sr"), sv(x, "qty"),
+                    sv(x, "sales"), sv(x, "indate"), sv(x, "outdate"), sv(x, "outqty"),
+                    sv(x, "outsales"), sv(x, "remark"), sv(x, "loc"),
+                    "⚠" if x.get("odd") else ""]
+                   + ([sv(x, "office")] if multi else []) for x in srows],
+                  widths=[26, 10, 18, 10, 12, 12, 12, 10, 12, 20, 12, 10]
+                         + ([12] if multi else []))
     elif view == "log":
         # 화면은 상한(LOG_MAX_ROWS)까지만 보여주지만 엑셀은 조건에 맞는 전체를 낸다.
         # 그래서 브라우저가 보낸 행을 쓰지 않고 같은 조건으로 서버가 다시 조회한다.
@@ -2733,10 +2740,24 @@ function showView(v){
 }
 
 // ── Excel 내보내기 (지금 보고 있는 화면 그대로) ──
+// 전체 합계의 샘플 행은 서버가 안 보내고 화면에서 합친다(전송량 절반).
+// 내보내기에는 그 합친 행을 실어 줘야 '샘플' 시트가 빠지지 않는다.
+function invForExport(key){
+  const I=INVS[key];
+  if(!I || !I.samples || !I.samples.merged) return I;
+  return {...I, samples:{...I.samples, rows:mergedSampleRows()}};
+}
+function mergedSampleRows(){
+  return Object.keys(INVS).flatMap(k=>{
+    const s=INVS[k] && INVS[k].samples;
+    return (s && !s.merged) ? s.rows : [];
+  });
+}
+
 function exportXlsx(){
   const b=document.getElementById('btn-xls');
   const body = VIEW==='inv'
-    ? {office:INVK, view:'inv', inventory:INVS[INVK]}
+    ? {office:INVK, view:'inv', inventory:invForExport(INVK)}
     : VIEW==='sm'
       ? {office:LEDGER, view:'log', ...SMARGS}
       : LOGMODE                                 // 기간 조회는 화면 상한과 무관하게 전체가 나간다
@@ -3600,10 +3621,7 @@ function drawSmpTable(){
 
   // 전체 합계는 서버가 행을 복사해 보내지 않는다 (같은 행을 두 번 받는 꼴이라).
   // 실별로 받은 것을 여기서 합친다.
-  let base = S.merged ? Object.keys(INVS).flatMap(k=>{
-      const s2=INVS[k]&&INVS[k].samples;
-      return (s2&&!s2.merged)?s2.rows:[];
-    }) : S.rows;
+  let base = S.merged ? mergedSampleRows() : S.rows;
   const ALLROWS=base;
   if(STAB==='held') base=base.filter(x=>x.held);
   if(STAB==='out')  base=base.filter(x=>!x.held);
