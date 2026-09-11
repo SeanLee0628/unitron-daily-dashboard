@@ -918,6 +918,103 @@ def parse_inventory(ws):
     )
 
 
+# ---------------------------------------------------------------- 샘플 현황
+# 샘플 시트는 실마다 이름이 다르다 ('warehouse sample list' / 'KEC sample list'
+# / 'Cyntec sample'). 이름으로 찾으면 실이 늘 때마다 코드를 고쳐야 하므로 헤더로 찾는다.
+# 헤더 줄 위치도 다르다 — 1행이 'SAMPLE LIST' 제목인 실이 있어 앞 세 줄을 훑는다.
+SAMPLE_HDR_ROWS = 3
+
+
+def _hkey(h):
+    return clean(h).replace(" ", "").upper()
+
+
+def sample_sheet(wb):
+    """샘플 시트를 이름이 아니라 헤더로 찾는다 → (ws, 헤더행). 없으면 (None, 0)."""
+    for name in wb.sheetnames:
+        ws = wb[name]
+        # 앞 세 줄만 읽는다 — 같은 파일의 'shipping management' 는 10만 행이라
+        # 전부 훑으면 업로드가 눈에 띄게 느려진다 (max_row 로 바로 끊긴다).
+        for hr, row in enumerate(ws.iter_rows(min_row=1, max_row=SAMPLE_HDR_ROWS,
+                                              values_only=True), start=1):
+            keys = {_hkey(v) for v in row if v is not None}
+            if "입고확인" in keys and "신청SALES" in keys and any(k.startswith("SR#") for k in keys):
+                return ws, hr
+    return None, 0
+
+
+def sdate(v):
+    """샘플 시트의 날짜 칸. 날짜가 아닌 글자('기존보유')도 그대로 남긴다."""
+    if isinstance(v, (datetime.datetime, datetime.date)):
+        return v.strftime("%Y-%m-%d")
+    s = clean(v)
+    # 일부 행은 날짜가 20250811 처럼 숫자로 들어와 있다 (엑셀이 날짜로 못 읽는 값)
+    if re.fullmatch(r"20\d{6}", s):
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return s
+
+
+def parse_samples(ws, hrow):
+    """샘플 시트 → 행 목록 + 집계. 품번 칸 이름이 실마다 다르다 (MPN / PART NUMBER)."""
+    rows = list(ws.iter_rows(min_row=hrow, values_only=True))
+    if len(rows) < 2:
+        return None
+    hdr = [_hkey(h) for h in rows[0]]
+
+    def idx(*names):
+        for n in names:
+            k = n.replace(" ", "").upper()
+            if k in hdr:
+                return hdr.index(k)
+        return -1
+
+    C = dict(no=idx("NO", "N"), status=idx("입고확인"), sr=idx("SR# or PO#", "SR#"),
+             part=idx("MPN", "PART NUMBER", "PART#"), qty=idx("Qty"),
+             sales=idx("신청SALES"), indate=idx("입고일"), outdate=idx("출고일"),
+             outqty=idx("출고수량", "출고수"), outsales=idx("출고SALES"),
+             remark=idx("비고"), loc=idx("위치"))
+    if C["part"] < 0 or C["status"] < 0:
+        return None
+
+    def g(r, k):
+        i = C[k]
+        return r[i] if 0 <= i < len(r) else None
+
+    def tight(d):
+        """빈 칸·0 은 실어 보내지 않는다. 샘플은 한 실이 7천 행이라 이것만으로도
+        브라우저로 내려가는 양이 20% 줄어든다."""
+        return {k: v for k, v in d.items() if v not in ("", 0, 0.0, False, None)}
+
+    out = []
+    for r in rows[1:]:
+        if not r or not any(v not in (None, "") for v in r):
+            continue
+        part = clean(g(r, "part"))
+        if not part:
+            continue
+        st = clean(g(r, "status"))
+        od = sdate(g(r, "outdate"))
+        out.append(tight(dict(
+            no=clean(g(r, "no")), status=st, sr=clean(g(r, "sr")), part=part,
+            qty=to_num(g(r, "qty")), sales=clean(g(r, "sales")),
+            indate=sdate(g(r, "indate")), outdate=od, outqty=to_num(g(r, "outqty")),
+            outsales=clean(g(r, "outsales")), remark=clean(g(r, "remark")),
+            loc=clean(g(r, "loc")),
+            # 담당자가 적는 '입고확인' 칸을 그대로 믿되, 출고일과 어긋나는 행은 따로 센다.
+            # 어느 쪽이 맞는지는 사람이 판단할 몫이라 고치지 않고 표시만 한다.
+            held=(st != "출고" and not od),
+            odd=bool((st == "입고" and od) or (st == "출고" and not od)),
+        )))
+
+    held = [x for x in out if x.get("held")]
+    return dict(
+        sheet=ws.title, n=len(out),
+        held_n=len(held), held_qty=sum(x.get("qty", 0) for x in held),
+        out_n=len(out) - len(held), odd_n=sum(1 for x in out if x.get("odd")),
+        rows=out,
+    )
+
+
 def day_block(date, inbound, outbound):
     cust = defaultdict(lambda: [0.0, 0])
     for r in outbound:
@@ -1133,7 +1230,18 @@ def merge_inventories(invs):
         dc.append(dict(year=y, items=n, qty=q))
 
     s = lambda k: sum(inv[k] for inv in invs)
+
+    smps = [inv["samples"] for inv in invs if inv.get("samples")]
+    samples = dict(
+        sheet=", ".join(sorted({x["sheet"] for x in smps})),
+        n=sum(x["n"] for x in smps), held_n=sum(x["held_n"] for x in smps),
+        held_qty=sum(x["held_qty"] for x in smps), out_n=sum(x["out_n"] for x in smps),
+        odd_n=sum(x["odd_n"] for x in smps),
+        merged=True, rows=[],
+    ) if smps else None
+
     return dict(
+        samples=samples,
         sheet=", ".join(sorted({inv["sheet"] for inv in invs})),
         n_items=len(items),
         total_qty=s("total_qty"), avail_qty=s("avail_qty"),
@@ -1197,6 +1305,19 @@ def build_payload(files, password):
             if ws is not None:
                 inv = parse_inventory(ws)
                 if inv:
+                    sws, shr = sample_sheet(wb)         # 샘플 시트도 같은 파일 안에 있다
+                    if sws is not None:
+                        smp = parse_samples(sws, shr)
+                        if smp:
+                            # 전체 합계에서 섞였을 때 구분용. 파일명을 그대로 넣으면
+                            # 7천 행에 같은 글자가 반복돼 전송량만 늘어난다 → 실 이름만.
+                            m = re.search(r"\(([^)]*실)\)", name)
+                            tag = m.group(1) if m else name
+                            for r in smp["rows"]:
+                                r["office"] = tag
+                            inv["samples"] = smp
+                            print(f"[샘플] {name} — '{smp['sheet']}' {smp['n']}행 "
+                                  f"(보유 {smp['held_n']} · 확인필요 {smp['odd_n']})")
                     inventories[name] = inv
                     # 재고 파일마다 들어 있는 'shipping management' 는 실별 시트가 아니라
                     # 전사 공용 출고 원장의 스냅샷이다 (실측: 파일 간 행 단위 99.4~99.8% 동일,
@@ -1390,6 +1511,21 @@ def export_xlsx(payload):
               ["MOBIS ID", "품목 수", "수량"],
               [[m["name"], m["items"], m["qty"]] for m in inv["by_family"]],
               widths=[20, 12, 16])
+        # 샘플 시트가 있는 실만. 보유중 → 출고완료 순으로, 각각 입고일 최신순.
+        smp = inv.get("samples")
+        if smp and smp["rows"]:
+            srows = sorted(smp["rows"],
+                           key=lambda x: (not x["held"], str(x.get("indate") or "")),
+                           reverse=False)
+            srows = ([x for x in srows if x["held"]][::-1]
+                     + [x for x in srows if not x["held"]][::-1])
+            sheet("샘플", f"샘플 현황 · {office}  (보유 {smp['held_n']}건 / 전체 {smp['n']}건)",
+                  ["품번", "입고확인", "SR# / PO#", "Qty", "신청SALES", "입고일",
+                   "출고일", "출고수량", "출고SALES", "비고", "위치", "확인필요"],
+                  [[x["part"], x["status"], x["sr"], x["qty"], x["sales"], x["indate"],
+                    x["outdate"], x["outqty"], x["outsales"], x["remark"], x["loc"],
+                    "⚠" if x["odd"] else ""] for x in srows],
+                  widths=[26, 10, 18, 10, 12, 12, 12, 10, 12, 20, 12, 10])
     elif view == "log":
         # 화면은 상한(LOG_MAX_ROWS)까지만 보여주지만 엑셀은 조건에 맞는 전체를 낸다.
         # 그래서 브라우저가 보낸 행을 쓰지 않고 같은 조건으로 서버가 다시 조회한다.
@@ -2244,6 +2380,14 @@ body.wideview #viewnav{max-width:min(1700px,98vw);}   /* 표만 넓어져 탭이
 .tabbtn{font-size:13px;font-weight:700;padding:9px 18px;border:none;background:#ececf1;color:#666;border-radius:10px 10px 0 0;cursor:pointer;font-family:inherit;}
 .tabbtn.on{background:#fff;color:var(--ink);box-shadow:0 -2px 8px rgba(0,0,0,.04);}
 .tabbtn .n{font-size:11px;color:var(--mut);margin-left:5px;font-weight:600;}
+/* 샘플 표의 상태 필터 (보유중 / 출고완료 / 확인필요 / 전체) — 검색줄 안에 같이 둔다 */
+.srch .seg{border:1.5px solid var(--line);background:#fff;font-family:inherit;font-size:12.5px;
+  font-weight:700;color:var(--mut);padding:8px 13px;border-radius:8px;cursor:pointer;}
+.srch .seg:hover{border-color:#cfcfd6;color:var(--ink);}
+.srch .seg.on{background:var(--red);border-color:var(--red);color:#fff;}
+.srch .seg .n{font-size:11px;opacity:.8;margin-left:5px;font-weight:700;}
+.srch .sep{width:1px;height:22px;background:var(--line);margin:0 4px;}
+tr.oddrow td{background:#fffaf0;}                 /* 입고확인과 출고일이 어긋난 행 */
 .tablewrap{background:#fff;border-radius:0 16px 16px 16px;box-shadow:0 1px 2px rgba(0,0,0,.04),0 6px 22px rgba(0,0,0,.05);overflow:hidden;margin-bottom:26px;}
 .scroll{max-height:520px;overflow:auto;}
 table{width:100%;border-collapse:collapse;font-size:12.5px;}
@@ -2371,8 +2515,9 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
       <button class="tabbtn on" id="ib-all" onclick="showInvTab('all')">전체 품목<span class="n" id="in-all"></span></button>
       <button class="tabbtn" id="ib-old" onclick="showInvTab('old')">장기재고<span class="n" id="in-old"></span></button>
       <button class="tabbtn" id="ib-bk" onclick="showInvTab('bk')">예약분<span class="n" id="in-bk"></span></button>
+      <button class="tabbtn" id="ib-smp" onclick="showInvTab('smp')">샘플<span class="n" id="in-smp"></span></button>
     </div>
-    <div class="tablewrap">
+    <div class="tablewrap" id="invwrap">
       <div class="srch" id="inv-srch">
         <select class="fsel" id="inv-f1"></select>
         <input class="fval" id="inv-v1" placeholder="값 입력…">
@@ -2384,6 +2529,26 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
         <span class="hit" id="inv-hit"></span>
       </div>
       <div class="scroll" id="invtable"></div>
+    </div>
+
+    <!-- 샘플 현황 (재고 파일 안의 'sample' 시트 — 실마다 시트 이름이 다르다) -->
+    <div class="tablewrap" id="smpwrap" style="display:none">
+      <div class="srch" id="smp-srch">
+        <button class="seg on" id="sb-held" onclick="showSmp('held')">보유중<span class="n" id="sn-held"></span></button>
+        <button class="seg" id="sb-out" onclick="showSmp('out')">출고완료<span class="n" id="sn-out"></span></button>
+        <button class="seg" id="sb-odd" onclick="showSmp('odd')">확인필요<span class="n" id="sn-odd"></span></button>
+        <button class="seg" id="sb-all" onclick="showSmp('all')">전체<span class="n" id="sn-all"></span></button>
+        <span class="sep"></span>
+        <select class="fsel" id="smp-f1"></select>
+        <input class="fval" id="smp-v1" placeholder="값 입력…">
+        <span class="andlab">AND</span>
+        <select class="fsel" id="smp-f2"></select>
+        <input class="fval" id="smp-v2" placeholder="값 입력…">
+        <button class="go" onclick="drawSmpTable()">조회</button>
+        <button class="off" onclick="clearSmpSearch()">초기화</button>
+        <span class="hit" id="smp-hit"></span>
+      </div>
+      <div class="scroll" id="smptable"></div>
     </div>
 
     <div class="grid">
@@ -2646,7 +2811,11 @@ function showUpload(){
 }
 // 저장된 데이터가 있으면 업로드 없이 바로 보여줌 (링크 공유용)
 fetch('/data').then(r=>r.json()).then(d=>{
-  if(d && d.offices && d.offices.length){ DATA=d; renderApp(); }
+  // 재고 파일만 올린 경우에도 화면을 그린다 — renderApp 은 이미 그 경우를 다룬다
+  // (입출고 없이 재고/샘플만 보려고 올리는 일이 실제로 있다).
+  const has = d && ((d.offices && d.offices.length) ||
+                    (d.inventories && Object.keys(d.inventories).length));
+  if(has){ DATA=d; renderApp(); }
 }).catch(()=>{});
 
 // 업로드한 파일에 있는 날짜(오늘·어제)는 그대로 쓰고,
@@ -2860,6 +3029,9 @@ const F_IO =[['all','전체'],['customer','거래처'],['part','PART#'],
 const F_INV=[['all','전체'],['part','PART#'],['customer','PO# / 고객'],['buyer','발주업체'],
              ['mobis','MOBIS ID'],['family','FAMILY'],['vender','VENDER'],
              ['sales','담당'],['office','실'],['memo','메모']];
+const F_SMP=[['all','전체'],['part','품번'],['sr','SR# / PO#'],['sales','신청SALES'],
+             ['outsales','출고SALES'],['status','입고확인'],['remark','비고'],
+             ['loc','위치'],['indate','입고일'],['outdate','출고일']];
 
 function fillFields(prefix, fields, d1, d2){
   const opt=f=>fields.map(([v,l])=>`<option value="${v}"${v===f?' selected':''}>${l}</option>`).join('');
@@ -2887,7 +3059,7 @@ function applyConds(rows, conds, allOf){
   return conds.length? rows.filter(r=>conds.every(c=>condMatch(r,c,allOf))) : rows;
 }
 
-const NUMCOL={qty:1,avail:1,booking:1,old:1};
+const NUMCOL={qty:1,avail:1,booking:1,old:1,outqty:1};
 const isNumCol=k=>NUMCOL[k]||/^y20\d\d$/.test(k);      // y2019… = Datecode 연도별 수량
 function cmpBy(k,d){
   return (a,b)=>{
@@ -3035,6 +3207,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   fillFields('io', F_IO, 'all', 'part');
   fillFields('inv', F_INV, 'all', 'part');
   fillFields('sm', F_IO, 'all', 'part');
+  fillFields('smp', F_SMP, 'all', 'part');
   ['sm-v1','sm-v2'].forEach(id=>{
     const el=document.getElementById(id);
     if(!el) return;
@@ -3072,6 +3245,16 @@ document.addEventListener('DOMContentLoaded',()=>{
   ['inv-f1','inv-f2'].forEach(id=>{
     const el=document.getElementById(id);
     if(el) el.addEventListener('change',drawInvTable);
+  });
+  ['smp-v1','smp-v2'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(!el) return;
+    el.addEventListener('input',()=>{ clearTimeout(LOGTMR); LOGTMR=setTimeout(drawSmpTable,250); });
+    el.addEventListener('keydown',e=>{ if(e.key==='Enter'){ clearTimeout(LOGTMR); drawSmpTable(); } });
+  });
+  ['smp-f1','smp-f2'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('change',drawSmpTable);
   });
   ['lg-from','lg-to'].forEach(id=>{
     const el=document.getElementById(id);
@@ -3364,14 +3547,98 @@ function renderInventory(){
   // 장기재고 탭은 Datecode 가 있는 실(영업1,2실)에서만 보여준다
   document.getElementById('ib-old').style.display=hasDC?'':'none';
   document.getElementById('in-bk').textContent=I.items.filter(x=>x.booking>0).length;
+  // 샘플 탭은 그 실의 재고 파일에 샘플 시트가 있을 때만 (없는 실도 있다)
+  const S=I.samples;
+  document.getElementById('ib-smp').style.display=S?'':'none';
+  if(S){
+    document.getElementById('in-smp').textContent=fmt(S.held_n);
+    document.getElementById('sn-held').textContent=fmt(S.held_n);
+    document.getElementById('sn-out').textContent=fmt(S.out_n);
+    document.getElementById('sn-odd').textContent=fmt(S.odd_n);
+    document.getElementById('sn-all').textContent=fmt(S.n);
+    document.getElementById('sb-odd').style.display=S.odd_n?'':'none';
+    if(STAB==='odd' && !S.odd_n) STAB='held';
+  }
   if(!hasDC && ITAB==='old') ITAB='all';
-  showInvTab('all');
+  showInvTab(ITAB==='smp'&&S?'smp':'all');
 }
 
 function showInvTab(t){
   ITAB=t;
-  ['all','old','bk'].forEach(k=>document.getElementById('ib-'+k).classList.toggle('on',k===t));
-  drawInvTable();
+  ['all','old','bk','smp'].forEach(k=>{
+    const b=document.getElementById('ib-'+k);
+    if(b) b.classList.toggle('on',k===t);
+  });
+  const smp = t==='smp';
+  document.getElementById('invwrap').style.display = smp?'none':'';
+  document.getElementById('smpwrap').style.display = smp?'':'none';
+  if(smp) drawSmpTable(); else drawInvTable();
+}
+
+// ================= 샘플 현황 =================
+// 재고 파일 안의 샘플 시트. 담당자가 '입고확인' 칸에 입고/출고를 직접 적는데
+// 출고일과 어긋난 행이 실제로 꽤 있다 (영업1,2실 566건). 어느 쪽이 맞는지는
+// 사람이 판단할 몫이라 고치지 않고 '확인필요' 로 모아서 보여주기만 한다.
+let STAB='held', SSORT={k:'',d:0};
+const SMP_ALL=x=>[x.part,x.sr,x.sales,x.outsales,x.status,x.remark,x.loc,x.indate,x.outdate,x.office];
+
+function showSmp(t){
+  STAB=t;
+  ['held','out','odd','all'].forEach(k=>{
+    const b=document.getElementById('sb-'+k);
+    if(b) b.classList.toggle('on',k===t);
+  });
+  drawSmpTable();
+}
+function sortSmp(key){ nextDir(SSORT,key); drawSmpTable(); }
+function clearSmpSearch(){ clearFields('smp'); drawSmpTable(); }
+
+function drawSmpTable(){
+  const I=INVS[INVK], S=I&&I.samples;
+  const el=document.getElementById('smptable');
+  if(!S){ el.innerHTML='<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">이 실의 재고 파일에는 샘플 시트가 없습니다</div>'; return; }
+
+  // 전체 합계는 서버가 행을 복사해 보내지 않는다 (같은 행을 두 번 받는 꼴이라).
+  // 실별로 받은 것을 여기서 합친다.
+  let base = S.merged ? Object.keys(INVS).flatMap(k=>{
+      const s2=INVS[k]&&INVS[k].samples;
+      return (s2&&!s2.merged)?s2.rows:[];
+    }) : S.rows;
+  const ALLROWS=base;
+  if(STAB==='held') base=base.filter(x=>x.held);
+  if(STAB==='out')  base=base.filter(x=>!x.held);
+  if(STAB==='odd')  base=base.filter(x=>x.odd);
+
+  const conds=condsOf('smp');
+  let rows=applyConds(base, conds, SMP_ALL);
+  document.getElementById('smp-hit').textContent=conds.length?hitText(rows.length,base.length):'';
+  // 기본은 입고일 최신순 — 최근에 들어온 샘플부터 보는 화면이라.
+  const DEF=(a,b)=>String(b.indate||'').localeCompare(String(a.indate||''));
+  rows=[...rows].sort(SSORT.d?cmpBy(SSORT.k,SSORT.d):DEF);
+
+  if(!rows.length){ el.innerHTML=base.length?noHit():'<div style="padding:40px;text-align:center;color:#aaa;font-size:13px">해당하는 샘플이 없습니다</div>'; return; }
+
+  const hasOff=new Set(ALLROWS.map(x=>x.office)).size>1;   // 전체 합계로 볼 때만
+  const T=(l,k,c)=>th(l,k,SSORT,'sortSmp',c);
+  el.innerHTML=`<table><thead><tr><th class="stk1">#</th>${T('품번','part','stk2')}
+    ${T('입고확인','status')}${T('SR# / PO#','sr')}${T('Qty','qty','n')}${T('신청SALES','sales')}
+    ${T('입고일','indate','nw')}${T('출고일','outdate','nw')}${T('출고수량','outqty','n')}
+    ${T('출고SALES','outsales')}${T('비고','remark')}${T('위치','loc')}${hasOff?T('실','office'):''}</tr></thead><tbody>${
+    rows.map((x,i)=>`<tr class="${x.odd?'oddrow':''}">
+      <td class="n stk1">${i+1}</td>
+      <td class="part stk2">${esc(x.part)}</td>
+      <td class="nw">${esc(x.status)||'—'}${x.odd?`<span class="warn" title="입고확인은 '${esc(x.status)}' 인데 출고일이 ${x.outdate?esc(x.outdate)+' 로 적혀':'비어'} 있습니다 (원본 시트 그대로)">⚠</span>`:''}</td>
+      <td class="nw">${esc(x.sr)||'—'}</td>
+      <td class="qty">${x.qty?fmt(x.qty):'—'}</td>
+      <td>${esc(x.sales)||'—'}</td>
+      <td class="nw">${esc(x.indate)||'—'}</td>
+      <td class="nw">${esc(x.outdate)||'—'}</td>
+      <td class="n">${x.outqty?fmt(x.outqty):'—'}</td>
+      <td>${esc(x.outsales)||'—'}</td>
+      <td>${esc(x.remark)||'—'}</td>
+      <td class="nw">${esc(x.loc)||'—'}</td>
+      ${hasOff?`<td class="nw">${esc(x.office)}</td>`:''}</tr>`).join('')}</tbody></table>`;
+  fixSticky();
 }
 
 let ISORT={k:'',d:0};                      // 재고 정렬 (기본 = 재고 수량 내림차순)
@@ -3451,7 +3718,7 @@ function drawInvTable(){
 // PART# 를 왼쪽에 붙여 둘 위치 = 실제로 그려진 '#' 칸 너비 (자리수에 따라 달라진다).
 // 화면이 숨어 있을 때 재면 0 이 나오므로 뷰를 켤 때도 한 번 더 잰다.
 function fixSticky(){
-  const el=document.getElementById('invtable');
+  const el=document.getElementById(ITAB==='smp'?'smptable':'invtable');
   const c1=el&&el.querySelector('tbody td');
   if(c1&&c1.offsetWidth) el.style.setProperty('--c1', c1.offsetWidth+'px');
 }
