@@ -1963,6 +1963,8 @@ SALES_EMAILS = {
         # 2026-09-10 — linday@ 오타를 lindsay@ 로 고쳤다 (3·4실에도 추가).
         "lindsay@unitrontech.com",
         "boeun.kim@unitrontech.com",
+        # 2026-09-11 — sdpark 추가 (4실 수신자에도 이미 있다).
+        "sdpark@unitrontech.com",
     ],
 }
 

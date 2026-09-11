@@ -78,8 +78,10 @@ class TestSendOfficeEmails(unittest.TestCase):
         상황이니 테스트가 따라간다 — 대신 지키려던 것(자기 실 밖으로 안 샌다)은
         한 실만 맡은 사람으로 검사한다.
         """
+        # 2026-09-11 — 4실 대표를 sdpark → yk.kwon 으로 바꿨다. sdpark 이 5실
+        # 담당자로도 들어가면서 '한 실만 맡은 사람' 이 아니게 됐다 (겸직 테스트로 옮김).
         전용 = {"12": "jini@unitrontech.com", "3": "bh.hwang@unitrontech.com",
-               "4": "sdpark@unitrontech.com", "5": "cj.lim@unitrontech.com"}
+               "4": "yk.kwon@unitrontech.com", "5": "cj.lim@unitrontech.com"}
         for slug, mail in 전용.items():
             self.assertIn(mail, app.OFFICE_EMAILS[slug], f"{slug}실 담당자")
             for other in set(app.OFFICE_EMAILS) - {slug}:
@@ -93,6 +95,7 @@ class TestSendOfficeEmails(unittest.TestCase):
             "sccho@unitrontech.com": ("12", "4", "5"),
             "harold@unitrontech.com": ("12", "4", "5"),
             "lindsay@unitrontech.com": ("3", "4", "5"),
+            "sdpark@unitrontech.com": ("4", "5"),          # 2026-09-11 5실 추가
         }.items():
             for slug in app.OFFICE_EMAILS:
                 (self.assertIn if slug in slugs else self.assertNotIn)(
