@@ -925,10 +925,6 @@ def parse_inventory(ws):
 SAMPLE_HDR_ROWS = 3
 
 
-def _hkey(h):
-    return clean(h).replace(" ", "").upper()
-
-
 def sample_sheet(wb):
     """샘플 시트를 이름이 아니라 헤더로 찾는다 → (ws, 헤더행). 없으면 (None, 0)."""
     for name in wb.sheetnames:
