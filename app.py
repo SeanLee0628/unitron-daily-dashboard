@@ -39,6 +39,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PW = os.environ.get("XLSX_PW", "")
 CHART_JS = os.path.join(HERE, "chart.umd.min.js")
 DATA_FILE = os.path.join(os.environ.get("DATA_DIR", HERE), "saved_data.json")  # 데이터 저장(공유)
+BOOT_AT = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # 프로세스 시작 시각(배포 확인용)
 LOG_DB = os.path.join(os.environ.get("DATA_DIR", HERE), "log.db")             # 입출고 이력(기간 조회)
 MEMO_VER = 2                    # 재고 메모 저장 형식 (2 = booking 칸 메모만)
 
@@ -2071,7 +2072,11 @@ class Handler(BaseHTTPRequestHandler):
             # 데이터가 재시작마다 사라질 때 원인을 눈으로 확인하려고 둔다.
             # 비밀번호·계정 같은 건 절대 싣지 않는다. 경로와 참/거짓만.
             d = os.path.dirname(LOG_DB)
+            # 어떤 커밋이 돌고 있는지 — 배포가 실제로 넘어갔는지 밖에서 볼 방법이 이것뿐이다.
+            # RENDER_GIT_COMMIT 는 Render 가 자동으로 넣어 준다 (로컬에서는 빈 값).
             info = {"DATA_DIR": os.environ.get("DATA_DIR") or "(미설정 → 앱 폴더 사용)",
+                    "commit": (os.environ.get("RENDER_GIT_COMMIT") or "(로컬)")[:7],
+                    "started": BOOT_AT,
                     "db_path": LOG_DB, "dir_exists": os.path.isdir(d)}
             try:
                 probe = os.path.join(d, ".write_test")
