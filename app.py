@@ -401,6 +401,38 @@ def log_store(office, by_dir, src="sheet"):
         cx.close()
 
 
+def daily_log_rows(per, by_dir):
+    """날짜 시트 → 이력에 넣을 {'in': [...], 'out': [...]}. 누적 시트가 놓친 날짜만.
+
+    자재팀이 18시에 날짜 시트를 갱신해도 누적 '입고'/'출고' 시트 반영은 하루 늦는다.
+    누적 시트만 이력에 넣으면 기간 조회 달력이 어제까지만 열려서, 당일 내역을
+    기간 조회·재고 현황에서 볼 수 없다 (실측: 2026-09-10 18시 이후에도 달력 상한
+    2026-09-09). 그래서 누적에 아직 없는 날짜만 날짜 시트에서 가져온다.
+
+    누적 시트에 이미 있는 날짜는 방향별로 건너뛴다 — 누적 쪽이 문서번호·Material
+    Code 까지 갖춘 정본이라 날짜 시트 행으로 덮어쓰면 칸이 빈다. 다음 날 누적분이
+    올라오면 log_store 가 (실·방향·날짜) 단위로 갈아끼우므로 그때 정본으로 바뀐다.
+
+    아직 오지 않은 날짜 시트(현장에서 빈 틀로 미리 만들어 두는 것)는 뺀다 —
+    today_index() 가 하루 보기에서 같은 이유로 거르는 것과 같은 판단이다.
+    """
+    have = {}
+    for d, rows in (by_dir or {}).items():
+        have[d] = {r["date"] for r in rows if r.get("date")}
+
+    today = today_kst()
+    out = {}
+    for sheet, (inb, outb) in per.items():
+        date = sheet[:10]
+        if date > today:
+            continue
+        for d, rows in (("in", inb), ("out", outb)):
+            if not rows or date in have.get(d, ()):
+                continue
+            out.setdefault(d, []).extend(dict(r, date=date) for r in rows)
+    return out
+
+
 # 검색·정렬에서 쓸 수 있는 칸. 화면 드롭다운과 1:1 이고, 여기 없는 이름은 무시한다
 # (정렬 키가 SQL 에 그대로 들어가므로 화이트리스트가 곧 주입 차단이다).
 LOG_FIELDS = {"customer": "customer", "part": "part", "sales": "sales",
@@ -1365,6 +1397,18 @@ def build_payload(files, password):
             for r in rows:
                 r["customer"] = C.canon(r.get("customer"))
         log_store(name, by_dir)
+
+    # 누적 시트가 아직 따라오지 못한 날짜(보통 당일)는 날짜 시트로 이력을 채운다.
+    # 여기까지 오면 raw_offices 행의 거래처 표기는 이미 통일돼 있다.
+    for name, per, _f in raw_offices:
+        daily = daily_log_rows(per, logs.get(name))
+        if not daily:
+            continue
+        n = log_store(name, daily, src="daily")
+        got = sorted({r["date"] for rs in daily.values() for r in rs})
+        print(f"[당일] {name} — 누적 시트에 아직 없는 {'·'.join(got)} "
+              f"{n:,}행을 날짜 시트에서 이력에 넣음")
+
     if shipmgmt:
         sm_rows, sm_file = pick_shipmgmt(shipmgmt)
         for r in sm_rows:
