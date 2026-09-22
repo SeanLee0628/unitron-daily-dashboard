@@ -2034,6 +2034,8 @@ SALES_EMAILS = {
         "boeun.kim@unitrontech.com",
         # 2026-09-11 — sdpark 추가 (4실 수신자에도 이미 있다).
         "sdpark@unitrontech.com",
+        # 2026-09-22 — sw.lee 추가 (4실 수신자에도 이미 있다).
+        "sw.lee@unitrontech.com",
     ],
 }
 
