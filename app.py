@@ -2954,7 +2954,7 @@ function renderDay(day, prev, tag, idx){
   exitLogUI();
   const k=day.kpi, pk=prev?prev.kpi:null;
   document.querySelectorAll('#dayseg button').forEach((b,i)=>b.classList.toggle('on',i===idx));
-  document.getElementById('h-date').innerHTML=`${esc(O.name)} <span class="d">·</span> ${esc(day.date)} ${tag}`;
+  document.getElementById('h-date').innerHTML=`${esc(O.name)} <span class="d">·</span> ${esc(day.date)} / ${tag}`;
   document.getElementById('h-meta').textContent=`${prev?'비교 기준 '+prev.date+' · ':'이전일 데이터 없음 · '}입고 ${fmt(k.in_cnt)}건 / 출고 ${fmt(k.out_cnt)}건`;
   document.getElementById('kpis').innerHTML=[
     ['in','입고 건수',k.in_cnt,'건',pk?pk.in_cnt:null],
