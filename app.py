@@ -838,12 +838,30 @@ def po_lookup(pos, pm=None):
 OLD_YEAR = 2022          # 이 해 이전 datecode = 장기 재고
 
 
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
+def _inv_rank(name):
+    """'Oct inventory' → (9999, 10), '25_Dec inventory' → (2025, 12).
+    연도 접두사가 없으면 올해 시트다 — 접두사 붙은 지난 연도보다 항상 뒤."""
+    m = re.match(r"\s*(?:(\d{2,4})[_\s-]*)?([A-Za-z]{3})", name)
+    if not m or m.group(2).lower() not in _MONTHS:
+        return (-1, -1)
+    y = m.group(1)
+    year = (2000 + int(y) if len(y) == 2 else int(y)) if y else 9999
+    return (year, _MONTHS[m.group(2).lower()])
+
+
 def inventory_sheet(wb):
-    """'Jul inventory' 처럼 이름이 inventory 로 끝나는 시트를 찾는다."""
-    for s in wb.sheetnames:
-        if s.strip().lower().endswith("inventory"):
-            return wb[s]
-    return None
+    """'Oct inventory' 처럼 이름이 inventory 로 끝나는 시트 중 가장 최근 달을 고른다.
+    파일 하나에 '25_Dec inventory', 'Jan inventory' … 'Oct inventory' 가 다 들어 있다.
+    전에는 첫 시트를 집어 작년 12월 재고가 나갔다 (영업5실 2026-10-06 실측)."""
+    cands = [s for s in wb.sheetnames if s.strip().lower().endswith("inventory")]
+    if not cands:
+        return None
+    # 순위가 같으면 시트 순서상 뒤쪽 (max 는 첫 최대값을 주므로 뒤집어서 넘긴다)
+    return wb[max(reversed(cands), key=_inv_rank)]
 
 
 def parse_inventory(ws):
