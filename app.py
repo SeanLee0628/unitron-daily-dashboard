@@ -205,22 +205,34 @@ def cmaster_store(rows):
 
 def cmaster_map():
     """{cmaster_key(이름): 코드}. 한 이름에 코드가 둘 이상이면 '사용' 인 것만 남기고,
-    그래도 둘 이상이면 고르지 않는다 (엉뚱한 코드보다 빈칸이 낫다)."""
-    cands = defaultdict(set)
+    그래도 둘 이상이면 고르지 않는다 (엉뚱한 코드보다 빈칸이 낫다).
+
+    마스터 이름 끝의 괄호 병기('이인텔리전스 주식회사(e-Intelligence Co.,Ltd.)')를 뗀
+    이름도 키로 쓰되, 원래 이름에 없는 키일 때만 쓴다 — '와이씨' 가 따로 있으면
+    '와이씨(아산)' 이 그걸 가리지 않게."""
+    exact, loose = defaultdict(set), defaultdict(set)
     cx = log_conn()
     try:
         for code, name, short, active in cx.execute("SELECT code,name,short,active FROM cmaster"):
             for n in {name, short}:
                 k = cmaster_key(n)
                 if k:
-                    cands[k].add((code, active != "미사용"))
+                    exact[k].add((code, active != "미사용"))
+                k2 = cmaster_key(re.sub(r"\([^()]*\)\s*$", "", n or ""))
+                if k2 and k2 != k:
+                    loose[k2].add((code, active != "미사용"))
     finally:
         cx.close()
     out = {}
-    for k, v in cands.items():
-        codes = {c for c, on in v if on} or {c for c, _ in v}
-        if len(codes) == 1:
-            out[k] = codes.pop()
+    for cands in (loose, exact):                    # exact 가 나중이라 같은 키면 이긴다
+        for k, v in cands.items():
+            if cands is loose and k in exact:
+                continue
+            codes = {c for c, on in v if on} or {c for c, _ in v}
+            if len(codes) == 1:
+                out[k] = codes.pop()
+            else:
+                out.pop(k, None)
     return out
 
 

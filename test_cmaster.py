@@ -36,6 +36,11 @@ class TestMaster(unittest.TestCase):
             ("100002", "중복 주식회사", "", "사용"),
             ("100003", "(주)옛코드", "", "미사용"),
             ("100004", "(주)옛코드", "", "사용"),
+            ("100005", "이인텔리전스 주식회사(e-Intelligence Co.,Ltd.)", "", "사용"),
+            ("100006", "주식회사 와이씨(아산)", "", "사용"),
+            ("100007", "주식회사 와이씨(본사)", "", "사용"),
+            ("100008", "에이비씨", "", "사용"),
+            ("100009", "에이비씨(구미)", "", "사용"),
             (None, None, None, None),
         ])
         app.cmaster_store(app.parse_cmaster(ws))
@@ -48,6 +53,9 @@ class TestMaster(unittest.TestCase):
         self.assertEqual(cm[app.cmaster_key("선민테크")], "138692")
         self.assertNotIn(app.cmaster_key("중복"), cm)                  # 둘 다 사용 → 고르지 않음
         self.assertEqual(cm[app.cmaster_key("옛코드")], "100004")      # 사용 쪽만
+        self.assertEqual(cm[app.cmaster_key("이인텔리전스")], "100005")  # 괄호 병기 뗀 이름
+        self.assertNotIn(app.cmaster_key("와이씨"), cm)                 # 지점 둘 → 고르지 않음
+        self.assertEqual(cm[app.cmaster_key("에이비씨")], "100008")      # 정확한 이름이 이긴다
 
     def test_apply_keeps_sheet_code_and_refreshes(self):
         row = lambda c, cc: dict(date="2026-10-23", customer=c, part="P", qty=1,  # noqa: E731
