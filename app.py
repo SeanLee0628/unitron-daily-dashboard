@@ -152,6 +152,108 @@ def norm_ccode(v):
     return "" if not v or v.startswith("#") else v
 
 
+# ---- 거래처코드 마스터 ('품목코드 생성기' 파일의 '거래처코드' 시트: 코드/거래처명/거래처약칭/사용여부)
+# 출고현황의 CUSTOMER# 는 수식이라 비는 행이 많다. 비어 있으면 이 마스터에서 거래처명으로 찾는다.
+# 마스터는 한 번 올리면 log.db 에 남고, 다시 올리면 통째로 바뀐다.
+_CORP_KO = re.compile(r"주식회사|유한회사|\(주\)|㈜|\(유\)")
+_CORP_EN = re.compile(r"(CO\.?,?LTD\.?|INC\.?|LTD\.?|CORP(ORATION)?\.?|,)$")
+
+
+def cmaster_key(s):
+    """마스터와 맞출 때 쓰는 키 — company_key 에 더해 법인 표기를 지운다.
+    '주식회사 선민테크' = '(주)선민테크' = '선민테크'. 영문 접미사는 끝에 붙은 것만 지운다
+    (중간까지 지우면 LINCOLN 이 LOLN 이 된다)."""
+    k = _CORP_KO.sub("", company_key(s).replace("​", ""))
+    while True:
+        k2 = _CORP_EN.sub("", k)
+        if k2 == k:
+            return k.strip(".,()")
+        k = k2
+
+
+def cmaster_sheet(wb):
+    """'코드'·'거래처명' 헤더가 첫 줄에 있는 시트. 이름이 바뀌어도 찾도록 헤더로 판별한다."""
+    for s in wb.sheetnames:
+        for r in wb[s].iter_rows(min_row=1, max_row=1, values_only=True):
+            if r and {"코드", "거래처명"} <= {_hkey(c) for c in r if clean(c)}:
+                return wb[s]
+    return None
+
+
+def parse_cmaster(ws):
+    """→ [(코드, 거래처명, 약칭, 사용여부)]"""
+    it = ws.iter_rows(values_only=True)
+    cols = {_hkey(c): i for i, c in enumerate(next(it)) if clean(c)}
+    out = []
+    for r in it:
+        code = cell(r, cols.get("코드"))
+        if code:
+            out.append((code, cell(r, cols.get("거래처명")), cell(r, cols.get("거래처약칭")),
+                        cell(r, cols.get("사용여부"))))
+    return out
+
+
+def cmaster_store(rows):
+    cx = log_conn()
+    try:
+        cx.execute("DELETE FROM cmaster")
+        cx.executemany("INSERT INTO cmaster(code,name,short,active) VALUES(?,?,?,?)", rows)
+        cx.commit()
+    finally:
+        cx.close()
+
+
+def cmaster_map():
+    """{cmaster_key(이름): 코드}. 한 이름에 코드가 둘 이상이면 '사용' 인 것만 남기고,
+    그래도 둘 이상이면 고르지 않는다 (엉뚱한 코드보다 빈칸이 낫다)."""
+    cands = defaultdict(set)
+    cx = log_conn()
+    try:
+        for code, name, short, active in cx.execute("SELECT code,name,short,active FROM cmaster"):
+            for n in {name, short}:
+                k = cmaster_key(n)
+                if k:
+                    cands[k].add((code, active != "미사용"))
+    finally:
+        cx.close()
+    out = {}
+    for k, v in cands.items():
+        codes = {c for c, on in v if on} or {c for c, _ in v}
+        if len(codes) == 1:
+            out[k] = codes.pop()
+    return out
+
+
+def cmaster_apply():
+    """이력(출고)에서 거래처코드가 빈 행을 마스터로 채운다. 채운 행은 ccsrc='m' 으로 표시해
+    두었다가 마스터가 바뀌면 지우고 다시 채운다 — 시트에 원래 있던 코드는 건드리지 않는다.
+    전사 출고 원장(sm)은 거래처코드 칸이 없어 제외."""
+    cm = cmaster_map()
+    cx = log_conn()
+    try:
+        cx.execute("UPDATE log SET ccode='', ccsrc=NULL WHERE ccsrc='m'")
+        # 거래처마다 UPDATE 를 돌리면 customer 색인이 없어 거래처 수만큼 전체를 훑는다
+        # (실측 20초). 빈 행을 한 번에 읽어 rowid 로 고친다.
+        upd = []
+        for rid, c in cx.execute("SELECT rowid, customer FROM log WHERE dir='out' AND slug<>? "
+                                 "AND COALESCE(ccode,'')=''", [LEDGER_SLUG]).fetchall():
+            code = cm.get(cmaster_key(c))
+            if code:
+                upd.append((code, rid))
+        cx.executemany("UPDATE log SET ccode=?, ccsrc='m' WHERE rowid=?", upd)
+        cx.commit()
+        return len(upd)
+    finally:
+        cx.close()
+
+
+def cmaster_fill(rows, cm):
+    """화면용 행(하루 보기)에서 빈 거래처코드를 마스터로 채운다."""
+    for r in rows:
+        if not r.get("ccode"):
+            r["ccode"] = cm.get(cmaster_key(r.get("customer")), "")
+
+
 def cell(r, i):
     """행에서 칸 번호로 값 하나. 칸이 없거나 행이 짧으면 빈 문자열."""
     return clean(r[i]) if i is not None and i < len(r) else ""
@@ -364,7 +466,7 @@ def log_conn():
     # src: 이 행이 어느 시트에서 왔나. 'sm'(shipping management) 이 'sheet'(누적 출고) 를 이긴다.
     # 같은 출고를 두 시트가 다르게 적고 있어서(누적=주문 단위, sm=lot 단위) 우선순위가 없으면
     # 마지막에 올린 파일이 이기는 비결정적 동작이 된다.
-    for col in ("src", "lot", "dcode", "waybill", "memo", "vendor", "ccode"):
+    for col in ("src", "lot", "dcode", "waybill", "memo", "vendor", "ccode", "ccsrc"):
         if col not in {r[1] for r in cx.execute("PRAGMA table_info(log)")}:
             cx.execute(f"ALTER TABLE log ADD COLUMN {col} TEXT")
             if col == "src":
@@ -386,6 +488,7 @@ def log_conn():
     # 같은 날 같은 거래처에 같은 lot·수량을 두 번 출고한 진짜 중복까지 한 벌로 줄어들 수 있으나,
     # lot 단위 원장에서 그런 행은 사실상 없고 수량이 4배로 잡히는 쪽이 훨씬 해롭다.
     cx.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+    cx.execute("CREATE TABLE IF NOT EXISTS cmaster(code TEXT, name TEXT, short TEXT, active TEXT)")
     # 선적 리포트(PO# → 발주업체). 주간 파일을 올릴 때마다 누적된다.
     # 같은 운송장·PO·파트·SO 로 수량만 다른 분할 선적이 실제로 있어서 qty 까지 키에 넣는다 —
     # 안 그러면 3,000EA 와 750EA 중 하나가 조용히 사라진다.
@@ -1378,6 +1481,7 @@ def build_payload(files, password):
     logs = {}                             # 실이름 → {'in': [...], 'out': [...]} 누적 이력
     ships = []                            # 선적 리포트 행 (PO# → 발주업체)
     shipmgmt = []                         # 전사 출고 원장 스냅샷 [(파일명, 행들)]
+    cmaster_n = 0                         # 이번에 올린 거래처코드 마스터 행 수
     for f in files:
         name = f.get("name") or "실"
         wb = open_wb(decode_upload(f["file"]), password)
@@ -1394,6 +1498,14 @@ def build_payload(files, password):
                               f"{'·'.join(dirs)}")
                 raw_offices.append((name, per, filled))
                 continue
+            ws = cmaster_sheet(wb)                      # 품목코드 생성기 (거래처코드 마스터)
+            if ws is not None:
+                cm_rows = parse_cmaster(ws)
+                if cm_rows:
+                    cmaster_store(cm_rows)
+                    cmaster_n = len(cm_rows)
+                    print(f"[거래처코드] {name} — 마스터 {cmaster_n:,}개 저장")
+                    continue
             ws = inventory_sheet(wb)                    # 재고 파일
             if ws is not None:
                 inv = parse_inventory(ws)
@@ -1430,9 +1542,10 @@ def build_payload(files, password):
     if ships:
         ship_store(ships)
 
-    if not raw_offices and not inventories and not ships:
+    if not raw_offices and not inventories and not ships and not cmaster_n:
         raise ValueError("날짜 시트(YYYY-MM-DD)가 있는 입출고 파일, 'inventory' 시트가 있는 "
-                         "재고 파일, 'PO Number' 가 있는 선적 리포트 중 아무것도 찾지 못했습니다.")
+                         "재고 파일, 'PO Number' 가 있는 선적 리포트, '거래처코드' 시트가 있는 "
+                         "품목코드 생성기 중 아무것도 찾지 못했습니다.")
 
     # ---- 거래처 표기 통일 (Mobis / MOBIS → 가장 많이 쓰인 표기 하나로) ----
     # 파일 전체를 본 뒤에야 대표 표기를 고를 수 있어 여기서 일괄 처리한다.
@@ -1514,6 +1627,16 @@ def build_payload(files, password):
         inv["customers"] = [dict(name=n, booking=v) for n, v in
                             sorted(bk.items(), key=lambda x: -x[1])[:12]]
 
+    # ---- 그래도 빈 거래처코드는 마스터(품목코드 생성기)로 ----
+    # 이력 저장이 다 끝난 뒤에 한다. 이력 쪽은 cmaster_apply 가 ccsrc 표시를 달아 채우므로
+    # 마스터가 바뀌면 다시 계산되고, 시트에 원래 있던 코드와 섞이지 않는다.
+    cm = cmaster_map()
+    for _, per, _f in raw_offices:
+        for _inb, outb in per.values():
+            cmaster_fill(outb, cm)
+    if cm:
+        print(f"[거래처코드] 이력 출고 {cmaster_apply():,}행에 마스터 코드 부여")
+
     offices = []
     allbydate = defaultdict(lambda: ([], []))
     for name, per, filled in raw_offices:
@@ -1533,7 +1656,7 @@ def build_payload(files, password):
     if shipmgmt:
         spans[LEDGER]["src"] = sm_file             # 이번에 채택한 파일
     return dict(offices=offices, inventories=inventories, spans=spans,
-                memo_ver=MEMO_VER)
+                memo_ver=MEMO_VER, cmaster=cmaster_n)
 
 
 # ---------------------------------------------------------------- Excel 내보내기
@@ -2292,10 +2415,16 @@ class Handler(BaseHTTPRequestHandler):
                         # 이력이 늘었을 수 있으니 보유 구간은 다시 계산해 준다
                         prev["spans"] = {o["name"]: log_span(o["name"])
                                          for o in prev.get("offices", [])}
-                        result = {**prev, "ship_only": True}
+                        if result.get("cmaster"):        # 거래처코드 마스터를 새로 올렸다
+                            cm = cmaster_map()
+                            for o in prev.get("offices", []):
+                                for d in o.get("days") or []:
+                                    cmaster_fill(d.get("out_rows") or [], cm)
+                        result = {**prev, "ship_only": True, "cmaster": result.get("cmaster", 0)}
                         with open(DATA_FILE, "w", encoding="utf-8") as f:
                             json.dump({k: v for k, v in result.items()
-                                       if k != "ship_only"}, f, ensure_ascii=False)
+                                       if k not in ("ship_only", "cmaster")}, f,
+                                      ensure_ascii=False)
                     except Exception:
                         pass
                 else:
@@ -2306,7 +2435,11 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 # 발송은 여기서 끝낸다. 업로더가 탭을 닫아도 메일은 나간다.
                 origin = payload.get("origin") or f"http://{self.headers.get('Host', 'localhost')}"
-                result["mail"] = send_office_emails(result, origin)
+                # 마스터만 올렸으면 입출고는 그대로라 메일을 다시 보내지 않는다
+                if result.get("ship_only") and result.get("cmaster"):
+                    result["mail"] = {"ok": [], "fail": [], "error": ""}
+                else:
+                    result["mail"] = send_office_emails(result, origin)
             elif self.path == "/export":
                 data = export_xlsx(payload)
                 self.send_response(200)
@@ -2559,7 +2692,7 @@ td.qty{font-weight:800;font-variant-numeric:tabular-nums;}
     <div id="drop">
       <div class="ic">📥</div>
       <div class="t">엑셀 파일들을 여기로 끌어다 놓거나 클릭 (여러 개 가능)</div>
-      <div class="h" id="pwhint">.xlsx · 비밀번호는 서버에 저장돼 있어 입력하지 않아도 됩니다 · 파일명의 (영업N실)로 실 구분</div>
+      <div class="h" id="pwhint">.xlsx · 비밀번호는 서버에 저장돼 있어 입력하지 않아도 됩니다 · 파일명의 (영업N실)로 실 구분 · 품목코드 생성기를 올리면 거래처코드 자동 부여</div>
       <input id="file" type="file" accept=".xlsx" multiple style="display:none">
     </div>
     <!-- 비밀번호는 서버(DEFAULT_PW)에 있다. 다른 비밀번호를 쓰는 파일일 때만 펼쳐서 입력한다. -->
@@ -2802,7 +2935,7 @@ function go(files){
     .then(r=>r.json()).then(res=>{
       document.getElementById('loading').style.display='none';
       if(res.error){ const e=document.getElementById('errmsg'); e.textContent='오류: '+res.error; e.style.display='block'; return; }
-      DATA=res; renderApp(); showMailResult(res.mail);
+      DATA=res; renderApp(); showMailResult(res.mail, res.cmaster);
     }).catch(e=>{document.getElementById('loading').style.display='none';
       const el=document.getElementById('errmsg'); el.textContent='전송 오류: '+e; el.style.display='block';});
   }).catch(e=>{document.getElementById('loading').style.display='none';
@@ -2948,13 +3081,14 @@ function officeLink(){ return location.origin+'/'+officeSlug(O.name); }
 // ── 자동 발송 결과 표시 ──
 // 발송 자체는 서버가 /build 안에서 이미 끝냈다. 여기서는 결과만 보여준다.
 // 그래서 이 배너를 못 보고 탭을 닫아도 메일은 이미 나간 뒤다.
-function showMailResult(m){
+function showMailResult(m, cmaster){
   const box=document.getElementById('mailnotice');
   const st=document.getElementById('emailstatus');
   if(!box||!st||!m) return;
   const ok=m.ok||[], fail=m.fail||[];
-  if(!ok.length && !fail.length && !m.error) return;
+  if(!ok.length && !fail.length && !m.error && !cmaster) return;
   st.innerHTML=
+    (cmaster?`🏷️ 거래처코드 마스터 <b>${fmt(cmaster)}</b>개 반영${ok.length||fail.length||m.error?' · ':''}`:'')+
     (m.error?`⚠️ 자동 발송 안 됨 — ${esc(m.error)}`:'')+
     (ok.length?`✅ 자동 발송 완료 — <b>${esc(ok.join(', '))}</b>`:'')+
     (fail.length?`${ok.length?' · ':''}❌ 실패: ${esc(fail.join(', '))}`:'');
